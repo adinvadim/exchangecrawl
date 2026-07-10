@@ -656,6 +656,15 @@ func TestFetchPageDoesNotRetryPermanentFailure(t *testing.T) {
 	}
 }
 
+func TestNormalizeEntryRejectsTimestampOutsideSQLiteNanosecondRange(t *testing.T) {
+	t.Parallel()
+
+	_, err := normalizeEntry(json.RawMessage(`{"id":"entry-1","transactionTime":"9223372036854775807"}`), source.Account{}, time.Now())
+	if err == nil {
+		t.Fatal("normalizeEntry() accepted timestamp outside SQLite nanosecond range")
+	}
+}
+
 func TestFetchPageDoesNotForwardSignedHeadersAcrossRedirect(t *testing.T) {
 	t.Parallel()
 

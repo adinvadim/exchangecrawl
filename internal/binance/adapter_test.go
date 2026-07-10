@@ -100,7 +100,7 @@ func TestFetchPageSignsIncomeRequestAndNormalizesEntry(t *testing.T) {
 	if entry.Exchange != model.ExchangeBinance || entry.AccountID != "main" || entry.AccountLabel != "Main" {
 		t.Fatalf("entry identity = %#v", entry)
 	}
-	if entry.EntryID != "9689322392" || entry.Category != "income" || entry.Type != "COMMISSION" {
+	if entry.EntryID != "COMMISSION:9689322392" || entry.Category != "income" || entry.Type != "COMMISSION" {
 		t.Fatalf("entry classification = %#v", entry)
 	}
 	if entry.Amount != "-0.12500000" || entry.Fee != "-0.12500000" || entry.CashFlow != "-0.12500000" {
@@ -204,6 +204,43 @@ func TestNormalizeIncomeErrorDoesNotEchoRemoteTransactionID(t *testing.T) {
 	}
 }
 
+func TestNormalizeIncomeScopesTransactionIDByIncomeType(t *testing.T) {
+	t.Parallel()
+
+	observedAt := time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC)
+	base := incomeRow{TranID: "9689322392", Time: observedAt.UnixMilli(), RawJSON: json.RawMessage(`{}`)}
+	commission := base
+	commission.IncomeType = "COMMISSION"
+	transfer := base
+	transfer.IncomeType = "TRANSFER"
+
+	commissionEntry, err := normalizeIncome(commission, source.Account{}, observedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transferEntry, err := normalizeIncome(transfer, source.Account{}, observedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commissionEntry.EntryID != "COMMISSION:9689322392" || transferEntry.EntryID != "TRANSFER:9689322392" {
+		t.Fatalf("scoped IDs = %q/%q", commissionEntry.EntryID, transferEntry.EntryID)
+	}
+	if commissionEntry.EntryID == transferEntry.EntryID {
+		t.Fatal("different income types share one ledger identity")
+	}
+}
+
+func TestNormalizeIncomeRejectsTimestampOutsideSQLiteNanosecondRange(t *testing.T) {
+	t.Parallel()
+
+	_, err := normalizeIncome(incomeRow{
+		TranID: "1", IncomeType: "TRANSFER", Time: 1<<63 - 1, RawJSON: json.RawMessage(`{}`),
+	}, source.Account{}, time.Now())
+	if err == nil {
+		t.Fatal("normalizeIncome() accepted timestamp outside SQLite nanosecond range")
+	}
+}
+
 func TestFetchPageRetriesTransientResponseWithFreshSignature(t *testing.T) {
 	t.Parallel()
 
@@ -257,7 +294,7 @@ func TestFetchPageRetriesTransientResponseWithFreshSignature(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetch page: %v", err)
 	}
-	if len(page.Entries) != 1 || page.Entries[0].EntryID != "retry-1" {
+	if len(page.Entries) != 1 || page.Entries[0].EntryID != "FUNDING_FEE:retry-1" {
 		t.Fatalf("entries = %#v", page.Entries)
 	}
 	if requests.Load() != 2 {

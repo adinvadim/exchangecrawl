@@ -31,6 +31,7 @@ const (
 	maxRetries          = 3
 	baseRetryDelay      = time.Second
 	maxRetryDelay       = 30 * time.Second
+	maxArchivedUnixMS   = (1<<63 - 1) / int64(time.Millisecond)
 )
 
 type Options struct {
@@ -386,16 +387,19 @@ func normalizeIncome(row incomeRow, account source.Account, observedAt time.Time
 	if entryID == "" {
 		return model.LedgerEntry{}, errors.New("income row has no transaction id")
 	}
-	if row.Time <= 0 {
-		return model.LedgerEntry{}, errors.New("income row has no occurrence time")
+	if row.Time <= 0 || row.Time > maxArchivedUnixMS {
+		return model.LedgerEntry{}, errors.New("income row has invalid occurrence time")
 	}
 
-	incomeType := strings.TrimSpace(row.IncomeType)
+	incomeType := strings.ToUpper(strings.TrimSpace(row.IncomeType))
+	if incomeType == "" {
+		return model.LedgerEntry{}, errors.New("income row has no income type")
+	}
 	entry := model.LedgerEntry{
 		Exchange:     model.ExchangeBinance,
 		AccountID:    account.ID,
 		AccountLabel: account.Label,
-		EntryID:      entryID,
+		EntryID:      incomeType + ":" + entryID,
 		Symbol:       strings.TrimSpace(row.Symbol),
 		Category:     "income",
 		Type:         incomeType,

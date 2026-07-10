@@ -90,7 +90,7 @@ func TestSyncFollowsOpaquePaginationCursor(t *testing.T) {
 	adapter := &scriptedAdapter{
 		exchange: model.ExchangeBybit,
 		pages: []scriptedPage{
-			{page: source.Page{Entries: []model.LedgerEntry{ledgerEntryFor(model.ExchangeBybit, "first", now.Add(-2*time.Hour), "one")}, NextCursor: "opaque:2"}},
+			{page: source.Page{Entries: []model.LedgerEntry{ledgerEntryFor(model.ExchangeBybit, "first", now.Add(-2*time.Hour), "one")}, NextCursor: " opaque:2\t"}},
 			{page: source.Page{Entries: []model.LedgerEntry{ledgerEntryFor(model.ExchangeBybit, "second", now.Add(-time.Hour), "two")}, Done: true}},
 		},
 	}
@@ -103,8 +103,82 @@ func TestSyncFollowsOpaquePaginationCursor(t *testing.T) {
 	if report.Pages != 2 || report.Entries != 2 {
 		t.Fatalf("Sync() pages/entries = %d/%d, want 2/2", report.Pages, report.Entries)
 	}
-	if got := adapter.requests[1].Cursor; got != "opaque:2" {
-		t.Errorf("second cursor = %q, want opaque:2", got)
+	if got := adapter.requests[1].Cursor; got != " opaque:2\t" {
+		t.Errorf("second cursor = %q, want exact opaque token", got)
+	}
+}
+
+func TestSyncRejectsTimestampOutsideSQLiteNanosecondRange(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	entry := ledgerEntry("out-of-range", time.UnixMilli(1<<63-1), "invalid time")
+	adapter := &scriptedAdapter{
+		exchange: model.ExchangeBinance,
+		pages:    []scriptedPage{{page: source.Page{Entries: []model.LedgerEntry{entry}, Done: true}}},
+	}
+	arc := openArchive(t, ctx, adapter, []source.Account{{ID: "primary", Label: "Primary"}}, now)
+
+	report, err := arc.Sync(ctx, archive.SyncRequest{})
+	if err == nil || !report.Degraded {
+		t.Fatalf("Sync() error/report = %v/%#v, want degraded timestamp rejection", err, report)
+	}
+	if report.Pages != 0 || report.Entries != 0 {
+		t.Fatalf("Sync() committed invalid timestamp: %#v", report)
+	}
+}
+
+func TestSyncRejectsEntryOutsideRequestedWindow(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	entry := ledgerEntry("outside-window", now.Add(time.Millisecond), "invalid window")
+	adapter := &scriptedAdapter{
+		exchange: model.ExchangeBinance,
+		pages:    []scriptedPage{{page: source.Page{Entries: []model.LedgerEntry{entry}, Done: true}}},
+	}
+	arc := openArchive(t, ctx, adapter, []source.Account{{ID: "primary", Label: "Primary"}}, now)
+
+	report, err := arc.Sync(ctx, archive.SyncRequest{})
+	if err == nil || !report.Degraded {
+		t.Fatalf("Sync() error/report = %v/%#v, want degraded window rejection", err, report)
+	}
+	if report.Pages != 0 || report.Entries != 0 {
+		t.Fatalf("Sync() committed out-of-window entry: %#v", report)
+	}
+}
+
+func TestSyncRejectsBoundaryOutsideArchiveTimestampRange(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	adapter := &scriptedAdapter{exchange: model.ExchangeBinance}
+	arc := openArchive(t, ctx, adapter, []source.Account{{ID: "primary", Label: "Primary"}}, now)
+	until := time.Date(1000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	_, err := arc.Sync(ctx, archive.SyncRequest{Until: &until})
+	if err == nil {
+		t.Fatal("Sync() accepted boundary outside Archive timestamp range")
+	}
+	if len(adapter.requests) != 0 {
+		t.Fatalf("FetchPage() calls = %d, want validation before remote access", len(adapter.requests))
+	}
+}
+
+func TestEntriesRejectsBoundaryOutsideArchiveTimestampRange(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	arc := openArchive(t, ctx, &scriptedAdapter{exchange: model.ExchangeBinance}, []source.Account{{ID: "primary", Label: "Primary"}}, now)
+	since := time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	_, err := arc.Entries(ctx, archive.EntryQuery{Since: &since})
+	if err == nil {
+		t.Fatal("Entries() accepted boundary outside Archive timestamp range")
 	}
 }
 

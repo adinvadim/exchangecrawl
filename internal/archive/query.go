@@ -64,10 +64,16 @@ func (a *Archive) Entries(ctx context.Context, query EntryQuery) ([]model.Ledger
 		args = append(args, value)
 	}
 	if query.Since != nil {
+		if err := validateArchiveTimestamp("entries start", query.Since.UTC()); err != nil {
+			return nil, err
+		}
 		where = append(where, "occurred_at >= ?")
 		args = append(args, query.Since.UTC().UnixNano())
 	}
 	if query.Until != nil {
+		if err := validateArchiveTimestamp("entries end", query.Until.UTC()); err != nil {
+			return nil, err
+		}
 		where = append(where, "occurred_at <= ?")
 		args = append(args, query.Until.UTC().UnixNano())
 	}

@@ -27,6 +27,7 @@ const (
 	maxRequestRetries    = 3
 	baseRetryDelay       = 250 * time.Millisecond
 	maxRetryDelay        = 30 * time.Second
+	maxArchivedUnixMS    = (1<<63 - 1) / int64(time.Millisecond)
 )
 
 // Options supplies process dependencies. Nil functions and zero values use
@@ -371,7 +372,7 @@ func normalizeEntry(raw json.RawMessage, account source.Account, observedAt time
 		return model.LedgerEntry{}, errors.New("Bybit transaction log entry has no id")
 	}
 	timestampMillis, err := strconv.ParseInt(record.TransactionTime, 10, 64)
-	if err != nil || timestampMillis < 0 {
+	if err != nil || timestampMillis < 0 || timestampMillis > maxArchivedUnixMS {
 		return model.LedgerEntry{}, errors.New("Bybit transaction log entry has invalid transactionTime")
 	}
 

@@ -100,6 +100,8 @@ Every row contains:
 - raw provider JSON for future remapping
 
 Primary identity is `(exchange, account_id, entry_id)`. Sync is idempotent.
+Binance scopes `tranId` by `incomeType` when deriving `entry_id`, matching the
+provider's uniqueness guarantee.
 SQLite uses WAL, file mode `0600`, schema versioning, deterministic query order,
 and FTS5 over searchable ledger text.
 
@@ -133,4 +135,3 @@ database health, and credential presence only; never credential values.
 - Tracer tests for windowing, pagination, idempotent upsert, account checkpoint
   safety, local query/search, control metadata, and secret redaction.
 - `go test ./...`, `go vet ./...`, and builds for both commands.
-

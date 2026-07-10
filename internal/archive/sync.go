@@ -60,9 +60,20 @@ func (e *DegradedSyncError) Error() string {
 
 func (a *Archive) Sync(ctx context.Context, request SyncRequest) (SyncReport, error) {
 	startedAt := a.now().UTC()
+	if err := validateArchiveTimestamp("current time", startedAt); err != nil {
+		return SyncReport{}, err
+	}
 	until := startedAt
 	if request.Until != nil {
 		until = request.Until.UTC()
+	}
+	if err := validateArchiveTimestamp("sync end", until); err != nil {
+		return SyncReport{}, err
+	}
+	if request.Since != nil {
+		if err := validateArchiveTimestamp("sync start", request.Since.UTC()); err != nil {
+			return SyncReport{}, err
+		}
 	}
 	accounts, err := a.selectedAccounts(request.AccountID)
 	if err != nil {
@@ -108,6 +119,9 @@ func (a *Archive) syncAccount(ctx context.Context, account source.Account, expli
 	start, err := a.syncStart(ctx, account.ID, explicitSince, until, initialLookback)
 	result := AccountSyncReport{AccountID: account.ID, Start: start, End: until}
 	if err != nil {
+		return result, err
+	}
+	if err := validateArchiveTimestamp("sync start", start); err != nil {
 		return result, err
 	}
 	if !start.Before(until) {
@@ -177,6 +191,9 @@ func (a *Archive) syncWindow(ctx context.Context, account source.Account, start,
 		if err != nil {
 			return pages, entries, fmt.Errorf("fetch page for %s: %w", account.ID, err)
 		}
+		if err := validatePageWindow(page.Entries, start, end); err != nil {
+			return pages, entries, err
+		}
 		fingerprint := pageIdentityFingerprint(page.Entries)
 		if _, duplicate := seenPages[fingerprint]; duplicate {
 			return pages, entries, errors.New("source repeated page content")
@@ -192,8 +209,8 @@ func (a *Archive) syncWindow(ctx context.Context, account source.Account, start,
 		}
 		// Provider pagination bugs must degrade the sync instead of spinning while
 		// repeatedly committing the same idempotent rows.
-		next := strings.TrimSpace(page.NextCursor)
-		if next == "" {
+		next := page.NextCursor
+		if strings.TrimSpace(next) == "" {
 			return pages, entries, errors.New("source returned an empty next cursor before completion")
 		}
 		if _, duplicate := seen[next]; duplicate {
@@ -203,6 +220,24 @@ func (a *Archive) syncWindow(ctx context.Context, account source.Account, start,
 		cursor = next
 	}
 	return pages, entries, fmt.Errorf("source exceeded %d pages in one window", maxPagesPerWindow)
+}
+
+func validatePageWindow(entries []model.LedgerEntry, start, end time.Time) error {
+	startMillis := start.UnixMilli()
+	endMillis := end.UnixMilli()
+	for index, entry := range entries {
+		if entry.OccurredAt.IsZero() {
+			return fmt.Errorf("source entry %d has no occurrence time", index)
+		}
+		if !fitsArchiveTimestamp(entry.OccurredAt) {
+			return fmt.Errorf("source entry %d occurrence time is outside Archive timestamp range", index)
+		}
+		occurredMillis := entry.OccurredAt.UnixMilli()
+		if occurredMillis < startMillis || occurredMillis > endMillis {
+			return fmt.Errorf("source entry %d occurrence time is outside requested window", index)
+		}
+	}
+	return nil
 }
 
 func pageIdentityFingerprint(entries []model.LedgerEntry) [sha256.Size]byte {
@@ -284,16 +319,33 @@ func (a *Archive) normalizeEntry(account source.Account, entry model.LedgerEntry
 	if entry.OccurredAt.IsZero() {
 		return model.LedgerEntry{}, errors.New("occurrence time is required")
 	}
+	if !fitsArchiveTimestamp(entry.OccurredAt) {
+		return model.LedgerEntry{}, errors.New("occurrence time is outside Archive timestamp range")
+	}
 	entry.OccurredAt = entry.OccurredAt.UTC()
 	if entry.ObservedAt.IsZero() {
 		entry.ObservedAt = a.now().UTC()
 	} else {
 		entry.ObservedAt = entry.ObservedAt.UTC()
 	}
+	if !fitsArchiveTimestamp(entry.ObservedAt) {
+		return model.LedgerEntry{}, errors.New("observation time is outside Archive timestamp range")
+	}
 	if len(entry.RawJSON) == 0 || !json.Valid(entry.RawJSON) {
 		return model.LedgerEntry{}, errors.New("raw Exchange JSON is required and must be valid")
 	}
 	return entry, nil
+}
+
+func fitsArchiveTimestamp(value time.Time) bool {
+	return time.Unix(0, value.UnixNano()).Equal(value)
+}
+
+func validateArchiveTimestamp(name string, value time.Time) error {
+	if !fitsArchiveTimestamp(value) {
+		return fmt.Errorf("%s is outside Archive timestamp range", name)
+	}
+	return nil
 }
 
 const upsertLedgerEntry = `
