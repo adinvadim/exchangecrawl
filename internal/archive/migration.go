@@ -55,68 +55,88 @@ type binanceMigrationRow struct {
 	rawJSON    string
 }
 
+const migrationBatchSize = 100
+
 func migrateBinanceEntryIDs(ctx context.Context, tx *sql.Tx) error {
+	var afterID int64
+	for {
+		entries, err := readBinanceMigrationBatch(ctx, tx, afterID)
+		if err != nil {
+			return err
+		}
+		if len(entries) == 0 {
+			return nil
+		}
+		for _, entry := range entries {
+			if err := migrateBinanceEntryID(ctx, tx, entry); err != nil {
+				return err
+			}
+		}
+		afterID = entries[len(entries)-1].id
+	}
+}
+
+func readBinanceMigrationBatch(ctx context.Context, tx *sql.Tx, afterID int64) ([]binanceMigrationRow, error) {
 	rows, err := tx.QueryContext(ctx, `
 select id, account_id, entry_id, observed_at, raw_json
 from ledger_entries
-where exchange = ?
-order by id`, model.ExchangeBinance)
+where exchange = ? and id > ?
+order by id
+limit ?`, model.ExchangeBinance, afterID, migrationBatchSize)
 	if err != nil {
-		return fmt.Errorf("read Binance Ledger Entries: %w", err)
+		return nil, fmt.Errorf("read Binance Ledger Entries: %w", err)
 	}
+	defer rows.Close()
 	var entries []binanceMigrationRow
 	for rows.Next() {
 		var entry binanceMigrationRow
 		if err := rows.Scan(&entry.id, &entry.accountID, &entry.entryID, &entry.observedAt, &entry.rawJSON); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("read Binance Ledger Entry: %w", err)
+			return nil, fmt.Errorf("read Binance Ledger Entry: %w", err)
 		}
 		entries = append(entries, entry)
 	}
 	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return fmt.Errorf("read Binance Ledger Entries: %w", err)
+		return nil, fmt.Errorf("read Binance Ledger Entries: %w", err)
 	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close Binance migration rows: %w", err)
+	return entries, nil
+}
+
+func migrateBinanceEntryID(ctx context.Context, tx *sql.Tx, entry binanceMigrationRow) error {
+	canonicalID, legacyID, err := scopedBinanceEntryID(entry.rawJSON)
+	if err != nil {
+		return fmt.Errorf("derive Binance Ledger Entry identity for row %d: %w", entry.id, err)
+	}
+	if entry.entryID == canonicalID {
+		return nil
+	}
+	if entry.entryID != legacyID {
+		return fmt.Errorf("Binance Ledger Entry row %d has an inconsistent identity", entry.id)
 	}
 
-	byIdentity := make(map[string]binanceMigrationRow, len(entries))
-	for _, entry := range entries {
-		byIdentity[migrationIdentity(entry.accountID, entry.entryID)] = entry
+	var existingID int64
+	var existingObservedAt int64
+	err = tx.QueryRowContext(ctx, `
+select id, observed_at
+from ledger_entries
+where exchange = ? and account_id = ? and entry_id = ?`,
+		model.ExchangeBinance, entry.accountID, canonicalID,
+	).Scan(&existingID, &existingObservedAt)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		return fmt.Errorf("find scoped Binance Ledger Entry: %w", err)
+	case existingObservedAt >= entry.observedAt:
+		if _, err := tx.ExecContext(ctx, `delete from ledger_entries where id = ?`, entry.id); err != nil {
+			return fmt.Errorf("remove superseded Binance Ledger Entry: %w", err)
+		}
+		return nil
+	default:
+		if _, err := tx.ExecContext(ctx, `delete from ledger_entries where id = ?`, existingID); err != nil {
+			return fmt.Errorf("replace superseded Binance Ledger Entry: %w", err)
+		}
 	}
-	for _, entry := range entries {
-		canonicalID, legacyID, err := scopedBinanceEntryID(entry.rawJSON)
-		if err != nil {
-			return fmt.Errorf("derive Binance Ledger Entry identity for row %d: %w", entry.id, err)
-		}
-		if entry.entryID == canonicalID {
-			continue
-		}
-		if entry.entryID != legacyID {
-			return fmt.Errorf("Binance Ledger Entry row %d has an inconsistent identity", entry.id)
-		}
-
-		legacyKey := migrationIdentity(entry.accountID, entry.entryID)
-		canonicalKey := migrationIdentity(entry.accountID, canonicalID)
-		if existing, ok := byIdentity[canonicalKey]; ok && existing.id != entry.id {
-			if existing.observedAt >= entry.observedAt {
-				if _, err := tx.ExecContext(ctx, `delete from ledger_entries where id = ?`, entry.id); err != nil {
-					return fmt.Errorf("remove superseded Binance Ledger Entry: %w", err)
-				}
-				delete(byIdentity, legacyKey)
-				continue
-			}
-			if _, err := tx.ExecContext(ctx, `delete from ledger_entries where id = ?`, existing.id); err != nil {
-				return fmt.Errorf("replace superseded Binance Ledger Entry: %w", err)
-			}
-		}
-		if _, err := tx.ExecContext(ctx, `update ledger_entries set entry_id = ? where id = ?`, canonicalID, entry.id); err != nil {
-			return fmt.Errorf("scope Binance Ledger Entry identity: %w", err)
-		}
-		delete(byIdentity, legacyKey)
-		entry.entryID = canonicalID
-		byIdentity[canonicalKey] = entry
+	if _, err := tx.ExecContext(ctx, `update ledger_entries set entry_id = ? where id = ?`, canonicalID, entry.id); err != nil {
+		return fmt.Errorf("scope Binance Ledger Entry identity: %w", err)
 	}
 	return nil
 }
@@ -147,8 +167,4 @@ func scopedBinanceEntryID(rawJSON string) (canonical string, legacy string, err 
 		return "", "", errors.New("Binance raw JSON has no transaction id")
 	}
 	return incomeType + ":" + legacy, legacy, nil
-}
-
-func migrationIdentity(accountID, entryID string) string {
-	return accountID + "\x00" + entryID
 }

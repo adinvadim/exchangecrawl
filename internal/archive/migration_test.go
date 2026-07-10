@@ -2,6 +2,8 @@ package archive
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -25,9 +27,9 @@ func TestOpenMigratesBinanceV1EntryIdentitiesWithoutDuplicates(t *testing.T) {
 	}
 	older := time.Date(2026, 7, 9, 0, 0, 0, 0, time.UTC)
 	newer := older.Add(time.Hour)
-	insertMigrationEntry(t, ctx, v1, "111", "TRANSFER", "1", "legacy-only", older, `{"incomeType":"TRANSFER","tranId":111}`)
-	insertMigrationEntry(t, ctx, v1, "222", "COMMISSION", "-1", "legacy-stale", older, `{"incomeType":"COMMISSION","tranId":"222"}`)
-	insertMigrationEntry(t, ctx, v1, "COMMISSION:222", "COMMISSION", "-2", "scoped-current", newer, `{"incomeType":"COMMISSION","tranId":"222"}`)
+	insertMigrationEntry(t, ctx, v1.DB(), "111", "TRANSFER", "1", "legacy-only", older, `{"incomeType":"TRANSFER","tranId":111}`)
+	insertMigrationEntry(t, ctx, v1.DB(), "222", "COMMISSION", "-1", "legacy-stale", older, `{"incomeType":"COMMISSION","tranId":"222"}`)
+	insertMigrationEntry(t, ctx, v1.DB(), "COMMISSION:222", "COMMISSION", "-2", "scoped-current", newer, `{"incomeType":"COMMISSION","tranId":"222"}`)
 	if err := v1.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -75,10 +77,68 @@ func TestOpenMigratesBinanceV1EntryIdentitiesWithoutDuplicates(t *testing.T) {
 	}
 }
 
+func TestOpenMigratesBinanceV1EntriesAcrossKeysetBatches(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "archive.db")
+	v1, err := store.Open(ctx, store.Options{
+		Path: path, Schema: archiveSchema + state.Schema, SchemaVersion: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observedAt := time.Date(2026, 7, 9, 0, 0, 0, 0, time.UTC)
+	err = v1.WithTx(ctx, func(tx *sql.Tx) error {
+		for index := range migrationBatchSize + 1 {
+			entryID := fmt.Sprintf("%d", 10_000+index)
+			insertMigrationEntry(t, ctx, tx, entryID, "TRANSFER", "1", "batch", observedAt,
+				fmt.Sprintf(`{"incomeType":"TRANSFER","tranId":%s}`, entryID))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := v1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	arc, err := Open(ctx, Options{
+		Path:     path,
+		Accounts: []source.Account{{ID: "primary", Label: "Primary"}},
+		Adapter:  migrationAdapter{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = arc.Close() })
+	entries, err := arc.Entries(ctx, EntryQuery{Limit: migrationBatchSize + 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != migrationBatchSize+1 {
+		t.Fatalf("migrated entries = %d, want %d", len(entries), migrationBatchSize+1)
+	}
+	byID := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		byID[entry.EntryID] = struct{}{}
+	}
+	for _, entryID := range []string{"TRANSFER:10000", fmt.Sprintf("TRANSFER:%d", 10_000+migrationBatchSize)} {
+		if _, ok := byID[entryID]; !ok {
+			t.Fatalf("missing migrated boundary identity %q", entryID)
+		}
+	}
+}
+
+type migrationExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
 func insertMigrationEntry(
 	t *testing.T,
 	ctx context.Context,
-	db *store.Store,
+	db migrationExecer,
 	entryID string,
 	entryType string,
 	amount string,
@@ -87,7 +147,7 @@ func insertMigrationEntry(
 	rawJSON string,
 ) {
 	t.Helper()
-	_, err := db.DB().ExecContext(ctx, upsertLedgerEntry,
+	_, err := db.ExecContext(ctx, upsertLedgerEntry,
 		model.ExchangeBinance,
 		"primary",
 		"Primary",
