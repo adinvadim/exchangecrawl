@@ -30,6 +30,7 @@ const (
 	maxResponseBytes    = 8 << 20
 	maxRetries          = 3
 	baseRetryDelay      = time.Second
+	maxRetryDelay       = 30 * time.Second
 )
 
 type Options struct {
@@ -301,15 +302,18 @@ func retryableResponse(statusCode int, err error) bool {
 func retryDelay(header string, now time.Time, attempt int) time.Duration {
 	header = strings.TrimSpace(header)
 	if seconds, err := strconv.ParseInt(header, 10, 64); err == nil && seconds >= 0 {
+		if seconds >= int64(maxRetryDelay/time.Second) {
+			return maxRetryDelay
+		}
 		return time.Duration(seconds) * time.Second
 	}
 	if retryAt, err := http.ParseTime(header); err == nil {
 		if delay := retryAt.Sub(now); delay > 0 {
-			return delay
+			return min(delay, maxRetryDelay)
 		}
 		return 0
 	}
-	return baseRetryDelay << attempt
+	return min(baseRetryDelay<<attempt, maxRetryDelay)
 }
 
 func sleepContext(ctx context.Context, duration time.Duration) error {
@@ -383,7 +387,7 @@ func normalizeIncome(row incomeRow, account source.Account, observedAt time.Time
 		return model.LedgerEntry{}, errors.New("income row has no transaction id")
 	}
 	if row.Time <= 0 {
-		return model.LedgerEntry{}, fmt.Errorf("income transaction %s has no occurrence time", entryID)
+		return model.LedgerEntry{}, errors.New("income row has no occurrence time")
 	}
 
 	incomeType := strings.TrimSpace(row.IncomeType)

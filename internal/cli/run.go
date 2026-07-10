@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/openclaw/crawlkit/config"
 	"github.com/openclaw/crawlkit/control"
@@ -184,7 +185,7 @@ func runDoctor(ctx context.Context, stdout io.Writer, spec Spec, configPath stri
 	}
 	if _, err := os.Stat(cfg.DBPath); err == nil {
 		report.DatabasePresent = true
-		if checkErr := archive.CheckDatabase(ctx, cfg.DBPath); checkErr == nil {
+		if checkErr := checkArchiveDatabase(ctx, cfg, adapter); checkErr == nil {
 			report.DatabaseReady = true
 		} else {
 			report.Ready = false
@@ -312,7 +313,7 @@ func runSync(ctx context.Context, stdout io.Writer, cfg appconfig.Config, adapte
 		for _, account := range report.Accounts {
 			fmt.Fprintf(stdout, "%s: entries=%d pages=%d", account.AccountID, account.Entries, account.Pages)
 			if account.Error != "" {
-				fmt.Fprintf(stdout, " error=%s", account.Error)
+				fmt.Fprintf(stdout, " error=%s", safeText(account.Error))
 			}
 			fmt.Fprintln(stdout)
 		}
@@ -410,10 +411,20 @@ func writeEntries(stdout io.Writer, entries []model.LedgerEntry, jsonOut bool) e
 	}
 	for _, entry := range entries {
 		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			entry.OccurredAt.UTC().Format(time.RFC3339), entry.AccountID,
-			entry.Symbol, entry.Type, entry.Amount, entry.Asset)
+			entry.OccurredAt.UTC().Format(time.RFC3339), safeText(entry.AccountID),
+			safeText(entry.Symbol), safeText(entry.Type), safeText(entry.Amount), safeText(entry.Asset))
 	}
 	return nil
+}
+
+func safeText(value string) string {
+	value = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+			return ' '
+		}
+		return r
+	}, value)
+	return strings.TrimSpace(value)
 }
 
 func openArchive(ctx context.Context, cfg appconfig.Config, adapter source.Adapter) (*archive.Archive, error) {
@@ -435,11 +446,26 @@ func openExistingArchive(ctx context.Context, cfg appconfig.Config, adapter sour
 }
 
 func openReadOnlyArchive(ctx context.Context, cfg appconfig.Config, adapter source.Adapter) (*archive.Archive, error) {
-	return archive.OpenReadOnly(ctx, archive.Options{
+	return archive.Open(ctx, archive.Options{
 		Path:     cfg.DBPath,
 		Accounts: cfg.SourceAccounts(),
 		Adapter:  adapter,
+		ReadOnly: true,
 	})
+}
+
+func checkArchiveDatabase(ctx context.Context, cfg appconfig.Config, adapter source.Adapter) error {
+	arc, err := archive.Open(ctx, archive.Options{
+		Path:           cfg.DBPath,
+		Accounts:       cfg.SourceAccounts(),
+		Adapter:        adapter,
+		ReadOnly:       true,
+		CheckIntegrity: true,
+	})
+	if err != nil {
+		return err
+	}
+	return arc.Close()
 }
 
 func optionalTime(value string) (*time.Time, error) {

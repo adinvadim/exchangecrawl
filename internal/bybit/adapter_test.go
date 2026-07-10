@@ -609,6 +609,17 @@ func TestFetchPageBoundsRetryableResponsesToThreeRetries(t *testing.T) {
 	}
 }
 
+func TestRetryDelayClampsUntrustedRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC)
+	for _, value := range []string{"999999999999999999", now.Add(100 * 365 * 24 * time.Hour).Format(http.TimeFormat)} {
+		if got := retryDelay(value, now, 0); got != maxRetryDelay {
+			t.Fatalf("retryDelay(%q) = %s, want %s", value, got, maxRetryDelay)
+		}
+	}
+}
+
 func TestFetchPageDoesNotRetryPermanentFailure(t *testing.T) {
 	t.Parallel()
 

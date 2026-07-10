@@ -253,11 +253,12 @@ func TestOpenReadOnlyQueriesExistingArchive(t *testing.T) {
 		t.Fatalf("Close() error = %v", err)
 	}
 
-	reader, err := archive.OpenReadOnly(ctx, archive.Options{
+	reader, err := archive.Open(ctx, archive.Options{
 		Path: path, Accounts: []source.Account{account}, Adapter: adapter,
+		ReadOnly: true,
 	})
 	if err != nil {
-		t.Fatalf("OpenReadOnly() error = %v", err)
+		t.Fatalf("Open(ReadOnly) error = %v", err)
 	}
 	t.Cleanup(func() { _ = reader.Close() })
 	entries, err := reader.Entries(ctx, archive.EntryQuery{})
@@ -286,18 +287,19 @@ func TestOpenReadOnlyRejectsUnrelatedSQLiteWithoutChangingSchema(t *testing.T) {
 		t.Fatalf("close unrelated SQLite: %v", err)
 	}
 
-	reader, err := archive.OpenReadOnly(ctx, archive.Options{
+	reader, err := archive.Open(ctx, archive.Options{
 		Path: path,
 		Accounts: []source.Account{{
 			ID: "primary", Label: "Primary",
 		}},
-		Adapter: &scriptedAdapter{exchange: model.ExchangeBinance},
+		Adapter:  &scriptedAdapter{exchange: model.ExchangeBinance},
+		ReadOnly: true,
 	})
 	if reader != nil {
 		_ = reader.Close()
 	}
 	if err == nil {
-		t.Fatal("OpenReadOnly() accepted unrelated SQLite")
+		t.Fatal("Open(ReadOnly) accepted unrelated SQLite")
 	}
 
 	inspector, err := store.OpenReadOnly(ctx, path)
@@ -312,7 +314,7 @@ func TestOpenReadOnlyRejectsUnrelatedSQLiteWithoutChangingSchema(t *testing.T) {
 		t.Fatalf("inspect schema: %v", err)
 	}
 	if ledgerTables != 0 {
-		t.Fatal("OpenReadOnly() added Archive schema to unrelated SQLite")
+		t.Fatal("Open(ReadOnly) added Archive schema to unrelated SQLite")
 	}
 }
 
@@ -354,12 +356,13 @@ func TestSyncRejectsRepeatedPageWithAdvancingCursor(t *testing.T) {
 
 	ctx := context.Background()
 	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
-	repeated := ledgerEntry("income-1", now.Add(-time.Hour), "repeated page")
+	first := ledgerEntry("income-1", now.Add(-time.Hour), "repeated page")
+	second := ledgerEntry("income-2", now.Add(-2*time.Hour), "reordered page")
 	adapter := &scriptedAdapter{
 		exchange: model.ExchangeBinance,
 		pages: []scriptedPage{
-			{page: source.Page{Entries: []model.LedgerEntry{repeated}, NextCursor: "2"}},
-			{page: source.Page{Entries: []model.LedgerEntry{repeated}, NextCursor: "3"}},
+			{page: source.Page{Entries: []model.LedgerEntry{first, second}, NextCursor: "2"}},
+			{page: source.Page{Entries: []model.LedgerEntry{second, first}, NextCursor: "3"}},
 		},
 	}
 	arc := openArchive(t, ctx, adapter, []source.Account{{ID: "primary", Label: "Primary"}}, now)
@@ -368,8 +371,8 @@ func TestSyncRejectsRepeatedPageWithAdvancingCursor(t *testing.T) {
 	if err == nil || len(report.Accounts) != 1 || !strings.Contains(report.Accounts[0].Error, "repeated page") {
 		t.Fatalf("Sync() error = %v, want repeated page error", err)
 	}
-	if !report.Degraded || report.Pages != 1 || report.Entries != 1 {
-		t.Fatalf("Sync() report = %#v, want one committed page and degradation", report)
+	if !report.Degraded || report.Pages != 1 || report.Entries != 2 {
+		t.Fatalf("Sync() report = %#v, want one committed two-entry page and degradation", report)
 	}
 	if got := len(adapter.requests); got != 2 {
 		t.Fatalf("FetchPage() calls = %d, want 2", got)

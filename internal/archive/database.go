@@ -30,17 +30,6 @@ from sync_state where 0`,
 	},
 }
 
-// CheckDatabase verifies that path is a healthy ExchangeCrawl Archive without
-// applying or migrating schema.
-func CheckDatabase(ctx context.Context, path string) error {
-	db, err := store.OpenReadOnly(ctx, path)
-	if err != nil {
-		return fmt.Errorf("open read-only Archive database: %w", err)
-	}
-	defer db.Close()
-	return checkDatabase(ctx, db)
-}
-
 func checkDatabase(ctx context.Context, db *store.Store) error {
 	if err := checkSchema(ctx, db); err != nil {
 		return err

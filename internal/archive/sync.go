@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -209,8 +210,12 @@ func pageIdentityFingerprint(entries []model.LedgerEntry) [sha256.Size]byte {
 	var length [8]byte
 	binary.LittleEndian.PutUint64(length[:], uint64(len(entries)))
 	_, _ = hash.Write(length[:])
+	ids := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		id := strings.TrimSpace(entry.EntryID)
+		ids = append(ids, strings.TrimSpace(entry.EntryID))
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
 		binary.LittleEndian.PutUint64(length[:], uint64(len(id)))
 		_, _ = hash.Write(length[:])
 		_, _ = hash.Write([]byte(id))
@@ -249,7 +254,7 @@ func (a *Archive) upsertPage(ctx context.Context, account source.Account, entrie
 				entry.ObservedAt.UnixNano(),
 				string(entry.RawJSON),
 			); err != nil {
-				return fmt.Errorf("upsert Ledger Entry %q: %w", entry.EntryID, err)
+				return fmt.Errorf("upsert Ledger Entry: %w", err)
 			}
 		}
 		return nil

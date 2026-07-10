@@ -18,10 +18,12 @@ import (
 const schemaVersion = 1
 
 type Options struct {
-	Path     string
-	Accounts []source.Account
-	Adapter  source.Adapter
-	Now      func() time.Time
+	Path           string
+	Accounts       []source.Account
+	Adapter        source.Adapter
+	Now            func() time.Time
+	ReadOnly       bool
+	CheckIntegrity bool
 }
 
 type Archive struct {
@@ -46,44 +48,30 @@ func Open(ctx context.Context, options Options) (*Archive, error) {
 	if now == nil {
 		now = time.Now
 	}
-	db, err := store.Open(ctx, store.Options{
-		Path:          options.Path,
-		Schema:        archiveSchema + state.Schema,
-		SchemaVersion: schemaVersion,
-	})
+	var db *store.Store
+	var err error
+	if options.ReadOnly {
+		db, err = store.OpenReadOnly(ctx, options.Path)
+	} else {
+		db, err = store.Open(ctx, store.Options{
+			Path:          options.Path,
+			Schema:        archiveSchema + state.Schema,
+			SchemaVersion: schemaVersion,
+		})
+	}
 	if err != nil {
 		return nil, fmt.Errorf("open Archive: %w", err)
 	}
-	return &Archive{
-		store:    db,
-		state:    state.NewWithClock(db.DB(), now),
-		adapter:  options.Adapter,
-		accounts: append([]source.Account(nil), options.Accounts...),
-		now:      now,
-	}, nil
-}
-
-func OpenReadOnly(ctx context.Context, options Options) (*Archive, error) {
-	if options.Adapter == nil {
-		return nil, errors.New("source adapter is required")
-	}
-	if len(options.Accounts) == 0 {
-		return nil, errors.New("at least one Connected Account is required")
-	}
-	if err := validateAccounts(options.Accounts); err != nil {
-		return nil, err
-	}
-	now := options.Now
-	if now == nil {
-		now = time.Now
-	}
-	db, err := store.OpenReadOnly(ctx, options.Path)
-	if err != nil {
-		return nil, fmt.Errorf("open read-only Archive: %w", err)
-	}
-	if err := checkSchema(ctx, db); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("open read-only Archive: %w", err)
+	if options.ReadOnly {
+		if options.CheckIntegrity {
+			err = checkDatabase(ctx, db)
+		} else {
+			err = checkSchema(ctx, db)
+		}
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("open read-only Archive: %w", err)
+		}
 	}
 	return &Archive{
 		store:    db,

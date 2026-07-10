@@ -192,6 +192,18 @@ func TestFetchPageSanitizesRemoteErrorControlCharacters(t *testing.T) {
 	}
 }
 
+func TestNormalizeIncomeErrorDoesNotEchoRemoteTransactionID(t *testing.T) {
+	t.Parallel()
+
+	_, err := normalizeIncome(incomeRow{TranID: "remote\n\x1b[31m", Time: 0}, source.Account{}, time.Now())
+	if err == nil {
+		t.Fatal("normalizeIncome() expected occurrence-time error")
+	}
+	if strings.Contains(err.Error(), "remote") || strings.ContainsAny(err.Error(), "\n\x1b") {
+		t.Fatalf("error echoes remote transaction id: %q", err)
+	}
+}
+
 func TestFetchPageRetriesTransientResponseWithFreshSignature(t *testing.T) {
 	t.Parallel()
 
@@ -345,6 +357,17 @@ func TestFetchPageStopsAfterThreeRetries(t *testing.T) {
 	}
 	if requests.Load() != maxRetries+1 || sleeps.Load() != maxRetries {
 		t.Fatalf("requests = %d, sleeps = %d; want %d, %d", requests.Load(), sleeps.Load(), maxRetries+1, maxRetries)
+	}
+}
+
+func TestRetryDelayClampsUntrustedRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC)
+	for _, value := range []string{"999999999999999999", now.Add(100 * 365 * 24 * time.Hour).Format(http.TimeFormat)} {
+		if got := retryDelay(value, now, 0); got != maxRetryDelay {
+			t.Fatalf("retryDelay(%q) = %s, want %s", value, got, maxRetryDelay)
+		}
 	}
 }
 

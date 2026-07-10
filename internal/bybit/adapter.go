@@ -26,6 +26,7 @@ const (
 	maxResponseBodyBytes = 8 << 20
 	maxRequestRetries    = 3
 	baseRetryDelay       = 250 * time.Millisecond
+	maxRetryDelay        = 30 * time.Second
 )
 
 // Options supplies process dependencies. Nil functions and zero values use
@@ -432,16 +433,19 @@ func (a *Adapter) waitBeforeRetry(ctx context.Context, retryAfter string, now ti
 
 func retryDelay(retryAfter string, now time.Time, attempt int) time.Duration {
 	retryAfter = strings.TrimSpace(retryAfter)
-	if seconds, err := strconv.ParseInt(retryAfter, 10, 32); err == nil && seconds >= 0 {
+	if seconds, err := strconv.ParseInt(retryAfter, 10, 64); err == nil && seconds >= 0 {
+		if seconds >= int64(maxRetryDelay/time.Second) {
+			return maxRetryDelay
+		}
 		return time.Duration(seconds) * time.Second
 	}
 	if deadline, err := http.ParseTime(retryAfter); err == nil {
 		if delay := deadline.Sub(now); delay > 0 {
-			return delay
+			return min(delay, maxRetryDelay)
 		}
 		return 0
 	}
-	return baseRetryDelay * time.Duration(1<<attempt)
+	return min(baseRetryDelay*time.Duration(1<<attempt), maxRetryDelay)
 }
 
 func sleepContext(ctx context.Context, delay time.Duration) error {
@@ -484,7 +488,7 @@ func readResponseBody(reader io.Reader) ([]byte, error) {
 
 func sanitizeRemoteMessage(message string, redactions ...string) string {
 	message = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
 			return ' '
 		}
 		return r

@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/openclaw/crawlkit/control"
 	"github.com/openclaw/crawlkit/store"
@@ -133,6 +135,31 @@ func TestRunDoctorRejectsUnrelatedSQLite(t *testing.T) {
 	}
 	if !report.DatabasePresent || report.DatabaseReady || report.Ready {
 		t.Fatalf("doctor report = %#v, want present but unhealthy database", report)
+	}
+}
+
+func TestWriteEntriesSanitizesTextOutput(t *testing.T) {
+	t.Parallel()
+
+	var stdout bytes.Buffer
+	err := writeEntries(&stdout, []model.LedgerEntry{{
+		OccurredAt: time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC),
+		AccountID:  "primary",
+		Symbol:     "BTC\nUSDT",
+		Type:       "TRADE\x1b[31m",
+		Amount:     "1\t.25",
+		Asset:      "USDT\u202e",
+	}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range stdout.String() {
+		if unicode.IsControl(r) && r != '\t' && r != '\n' || unicode.In(r, unicode.Cf) {
+			t.Fatalf("text output contains unsafe control %U: %q", r, stdout.String())
+		}
+	}
+	if strings.Count(stdout.String(), "\n") != 1 {
+		t.Fatalf("entry injected extra output lines: %q", stdout.String())
 	}
 }
 
