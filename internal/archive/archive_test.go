@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/adinvadim/exchangecrawl/internal/archive"
 	"github.com/adinvadim/exchangecrawl/internal/model"
 	"github.com/adinvadim/exchangecrawl/internal/source"
+	"github.com/openclaw/crawlkit/store"
 )
 
 func TestFirstSyncUsesPreviousSevenDays(t *testing.T) {
@@ -223,6 +225,97 @@ func TestEntriesAndSearchStayLocal(t *testing.T) {
 	}
 }
 
+func TestOpenReadOnlyQueriesExistingArchive(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "archive.db")
+	account := source.Account{ID: "primary", Label: "Primary"}
+	adapter := &scriptedAdapter{
+		exchange: model.ExchangeBinance,
+		pages: []scriptedPage{{page: source.Page{
+			Entries: []model.LedgerEntry{ledgerEntry("income-1", now.Add(-time.Hour), "read only")},
+			Done:    true,
+		}}},
+	}
+	writer, err := archive.Open(ctx, archive.Options{
+		Path: path, Accounts: []source.Account{account}, Adapter: adapter,
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if _, err := writer.Sync(ctx, archive.SyncRequest{}); err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	reader, err := archive.OpenReadOnly(ctx, archive.Options{
+		Path: path, Accounts: []source.Account{account}, Adapter: adapter,
+	})
+	if err != nil {
+		t.Fatalf("OpenReadOnly() error = %v", err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+	entries, err := reader.Entries(ctx, archive.EntryQuery{})
+	if err != nil {
+		t.Fatalf("Entries() error = %v", err)
+	}
+	if len(entries) != 1 || entries[0].EntryID != "income-1" {
+		t.Fatalf("Entries() = %#v, want income-1", entries)
+	}
+}
+
+func TestOpenReadOnlyRejectsUnrelatedSQLiteWithoutChangingSchema(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "unrelated.db")
+	unrelated, err := store.Open(ctx, store.Options{
+		Path:          path,
+		Schema:        `create table unrelated(id integer primary key);`,
+		SchemaVersion: 1,
+	})
+	if err != nil {
+		t.Fatalf("create unrelated SQLite: %v", err)
+	}
+	if err := unrelated.Close(); err != nil {
+		t.Fatalf("close unrelated SQLite: %v", err)
+	}
+
+	reader, err := archive.OpenReadOnly(ctx, archive.Options{
+		Path: path,
+		Accounts: []source.Account{{
+			ID: "primary", Label: "Primary",
+		}},
+		Adapter: &scriptedAdapter{exchange: model.ExchangeBinance},
+	})
+	if reader != nil {
+		_ = reader.Close()
+	}
+	if err == nil {
+		t.Fatal("OpenReadOnly() accepted unrelated SQLite")
+	}
+
+	inspector, err := store.OpenReadOnly(ctx, path)
+	if err != nil {
+		t.Fatalf("inspect unrelated SQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = inspector.Close() })
+	var ledgerTables int
+	if err := inspector.DB().QueryRowContext(ctx,
+		`select count(*) from sqlite_schema where type = 'table' and name = 'ledger_entries'`,
+	).Scan(&ledgerTables); err != nil {
+		t.Fatalf("inspect schema: %v", err)
+	}
+	if ledgerTables != 0 {
+		t.Fatal("OpenReadOnly() added Archive schema to unrelated SQLite")
+	}
+}
+
 func TestSyncRejectsRepeatedPaginationCursor(t *testing.T) {
 	t.Parallel()
 
@@ -253,6 +346,40 @@ func TestSyncRejectsRepeatedPaginationCursor(t *testing.T) {
 	}
 	if status.Accounts[0].Checkpoint != nil {
 		t.Fatalf("Checkpoint = %v after repeated cursor", status.Accounts[0].Checkpoint)
+	}
+}
+
+func TestSyncRejectsRepeatedPageWithAdvancingCursor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	repeated := ledgerEntry("income-1", now.Add(-time.Hour), "repeated page")
+	adapter := &scriptedAdapter{
+		exchange: model.ExchangeBinance,
+		pages: []scriptedPage{
+			{page: source.Page{Entries: []model.LedgerEntry{repeated}, NextCursor: "2"}},
+			{page: source.Page{Entries: []model.LedgerEntry{repeated}, NextCursor: "3"}},
+		},
+	}
+	arc := openArchive(t, ctx, adapter, []source.Account{{ID: "primary", Label: "Primary"}}, now)
+
+	report, err := arc.Sync(ctx, archive.SyncRequest{})
+	if err == nil || len(report.Accounts) != 1 || !strings.Contains(report.Accounts[0].Error, "repeated page") {
+		t.Fatalf("Sync() error = %v, want repeated page error", err)
+	}
+	if !report.Degraded || report.Pages != 1 || report.Entries != 1 {
+		t.Fatalf("Sync() report = %#v, want one committed page and degradation", report)
+	}
+	if got := len(adapter.requests); got != 2 {
+		t.Fatalf("FetchPage() calls = %d, want 2", got)
+	}
+	status, statusErr := arc.Status(ctx)
+	if statusErr != nil {
+		t.Fatalf("Status() error = %v", statusErr)
+	}
+	if status.Accounts[0].Checkpoint != nil {
+		t.Fatalf("Checkpoint = %v after repeated page", status.Accounts[0].Checkpoint)
 	}
 }
 

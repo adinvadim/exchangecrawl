@@ -63,6 +63,37 @@ func Open(ctx context.Context, options Options) (*Archive, error) {
 	}, nil
 }
 
+func OpenReadOnly(ctx context.Context, options Options) (*Archive, error) {
+	if options.Adapter == nil {
+		return nil, errors.New("source adapter is required")
+	}
+	if len(options.Accounts) == 0 {
+		return nil, errors.New("at least one Connected Account is required")
+	}
+	if err := validateAccounts(options.Accounts); err != nil {
+		return nil, err
+	}
+	now := options.Now
+	if now == nil {
+		now = time.Now
+	}
+	db, err := store.OpenReadOnly(ctx, options.Path)
+	if err != nil {
+		return nil, fmt.Errorf("open read-only Archive: %w", err)
+	}
+	if err := checkSchema(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open read-only Archive: %w", err)
+	}
+	return &Archive{
+		store:    db,
+		state:    state.NewWithClock(db.DB(), now),
+		adapter:  options.Adapter,
+		accounts: append([]source.Account(nil), options.Accounts...),
+		now:      now,
+	}, nil
+}
+
 func (a *Archive) Close() error {
 	if a == nil || a.store == nil {
 		return nil

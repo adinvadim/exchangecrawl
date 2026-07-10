@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/adinvadim/exchangecrawl/internal/model"
 	"github.com/adinvadim/exchangecrawl/internal/source"
@@ -26,6 +28,8 @@ const (
 	pageLimit           = 1000
 	defaultRecvWindow   = 5000
 	maxResponseBytes    = 8 << 20
+	maxRetries          = 3
+	baseRetryDelay      = time.Second
 )
 
 type Options struct {
@@ -33,6 +37,7 @@ type Options struct {
 	HTTPClient *http.Client
 	Now        func() time.Time
 	LookupEnv  func(string) (string, bool)
+	Sleep      func(context.Context, time.Duration) error
 	RecvWindow int
 }
 
@@ -41,6 +46,7 @@ type Adapter struct {
 	httpClient *http.Client
 	now        func() time.Time
 	lookupEnv  func(string) (string, bool)
+	sleep      func(context.Context, time.Duration) error
 	recvWindow int
 }
 
@@ -75,7 +81,6 @@ func New(options Options) (*Adapter, error) {
 	}
 
 	baseURL := strings.TrimSpace(options.BaseURL)
-	allowHTTP := baseURL != ""
 	if baseURL == "" {
 		if configured, ok := lookupEnv(baseURLEnv); ok && strings.TrimSpace(configured) != "" {
 			baseURL = strings.TrimSpace(configured)
@@ -83,7 +88,7 @@ func New(options Options) (*Adapter, error) {
 			baseURL = defaultBaseURL
 		}
 	}
-	parsedBaseURL, err := parseBaseURL(baseURL, allowHTTP)
+	parsedBaseURL, err := parseBaseURL(baseURL, options.HTTPClient != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -101,6 +106,10 @@ func New(options Options) (*Adapter, error) {
 	if now == nil {
 		now = time.Now
 	}
+	sleep := options.Sleep
+	if sleep == nil {
+		sleep = sleepContext
+	}
 	recvWindow := options.RecvWindow
 	if recvWindow == 0 {
 		recvWindow = defaultRecvWindow
@@ -114,6 +123,7 @@ func New(options Options) (*Adapter, error) {
 		httpClient: httpClient,
 		now:        now,
 		lookupEnv:  lookupEnv,
+		sleep:      sleep,
 		recvWindow: recvWindow,
 	}, nil
 }
@@ -155,7 +165,6 @@ func (a *Adapter) FetchPage(ctx context.Context, request source.PageRequest) (so
 	query.Set("endTime", strconv.FormatInt(request.End.UnixMilli(), 10))
 	query.Set("page", strconv.FormatUint(pageNumber, 10))
 	query.Set("limit", strconv.Itoa(pageLimit))
-	query.Set("timestamp", strconv.FormatInt(a.now().UnixMilli(), 10))
 	query.Set("recvWindow", strconv.Itoa(a.recvWindow))
 
 	var rows []incomeRow
@@ -188,44 +197,57 @@ func (a *Adapter) signedGET(
 	secret string,
 	out any,
 ) error {
-	unsignedQuery := query.Encode()
-	signature := sign(secret, unsignedQuery)
-	endpoint := *a.baseURL
-	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + path
-	endpoint.RawQuery = unsignedQuery + "&signature=" + signature
+	for attempt := 0; ; attempt++ {
+		attemptedAt := a.now().UTC()
+		query.Set("timestamp", strconv.FormatInt(attemptedAt.UnixMilli(), 10))
+		unsignedQuery := query.Encode()
+		signature := sign(secret, unsignedQuery)
+		endpoint := *a.baseURL
+		endpoint.Path = strings.TrimRight(endpoint.Path, "/") + path
+		endpoint.RawQuery = unsignedQuery + "&signature=" + signature
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-	if err != nil {
-		return &RequestError{Operation: "income"}
-	}
-	request.Header.Set("Accept", "application/json")
-	request.Header.Set("User-Agent", "binancecrawl/0")
-	request.Header.Set("X-MBX-APIKEY", apiKey)
-
-	response, err := a.httpClient.Do(request)
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+		if err != nil {
+			return &RequestError{Operation: "income"}
 		}
-		return &RequestError{Operation: "income"}
-	}
-	defer response.Body.Close()
+		request.Header.Set("Accept", "application/json")
+		request.Header.Set("User-Agent", "binancecrawl/0")
+		request.Header.Set("X-MBX-APIKEY", apiKey)
 
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
-	if err != nil || len(body) > maxResponseBytes {
-		return &RequestError{Operation: "income response"}
-	}
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return decodeAPIError(response.StatusCode, body, endpoint.String(), endpoint.RawQuery, apiKey, secret, signature)
-	}
-	if err := json.Unmarshal(body, out); err != nil {
-		var providerError apiErrorResponse
-		if json.Unmarshal(body, &providerError) == nil && providerError.Code != 0 {
-			return newAPIError(response.StatusCode, providerError, endpoint.String(), endpoint.RawQuery, apiKey, secret, signature)
+		response, err := a.httpClient.Do(request)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return &RequestError{Operation: "income"}
 		}
-		return &RequestError{Operation: "income response decode"}
+
+		body, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+		_ = response.Body.Close()
+		var responseErr error
+		switch {
+		case readErr != nil || len(body) > maxResponseBytes:
+			responseErr = &RequestError{Operation: "income response"}
+		case response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices:
+			responseErr = decodeAPIError(response.StatusCode, body, endpoint.String(), endpoint.RawQuery, apiKey, secret, signature)
+		case json.Unmarshal(body, out) != nil:
+			var providerError apiErrorResponse
+			if json.Unmarshal(body, &providerError) == nil && providerError.Code != 0 {
+				responseErr = newAPIError(response.StatusCode, providerError, endpoint.String(), endpoint.RawQuery, apiKey, secret, signature)
+			} else {
+				responseErr = &RequestError{Operation: "income response decode"}
+			}
+		default:
+			return nil
+		}
+
+		if attempt >= maxRetries || !retryableResponse(response.StatusCode, responseErr) {
+			return responseErr
+		}
+		if err := a.sleep(ctx, retryDelay(response.Header.Get("Retry-After"), attemptedAt, attempt)); err != nil {
+			return err
+		}
 	}
-	return nil
 }
 
 type apiErrorResponse struct {
@@ -255,11 +277,58 @@ func redact(message string, sensitive ...string) string {
 			message = strings.ReplaceAll(message, value, "[REDACTED]")
 		}
 	}
+	message = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+			return ' '
+		}
+		return r
+	}, message)
 	message = strings.TrimSpace(message)
 	if len(message) > 1024 {
 		message = message[:1024]
 	}
 	return message
+}
+
+func retryableResponse(statusCode int, err error) bool {
+	if statusCode == http.StatusTeapot || statusCode == http.StatusTooManyRequests || statusCode >= 500 && statusCode <= 599 {
+		return true
+	}
+	var apiError *APIError
+	return errors.As(err, &apiError) && apiError.Code == -1003
+}
+
+func retryDelay(header string, now time.Time, attempt int) time.Duration {
+	header = strings.TrimSpace(header)
+	if seconds, err := strconv.ParseInt(header, 10, 64); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if retryAt, err := http.ParseTime(header); err == nil {
+		if delay := retryAt.Sub(now); delay > 0 {
+			return delay
+		}
+		return 0
+	}
+	return baseRetryDelay << attempt
+}
+
+func sleepContext(ctx context.Context, duration time.Duration) error {
+	if duration <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 type flexibleID string
@@ -371,12 +440,12 @@ func envName(configured, fallback string) string {
 	return fallback
 }
 
-func parseBaseURL(raw string, allowHTTP bool) (*url.URL, error) {
+func parseBaseURL(raw string, allowLoopbackHTTP bool) (*url.URL, error) {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return nil, errors.New("Binance futures base URL must be an origin URL")
 	}
-	if parsed.Scheme != "https" && !(allowHTTP && parsed.Scheme == "http") {
+	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && allowLoopbackHTTP && isLoopbackHost(parsed.Hostname())) {
 		return nil, errors.New("Binance futures base URL must use HTTPS")
 	}
 	if parsed.Path != "" && parsed.Path != "/" {
@@ -384,4 +453,12 @@ func parseBaseURL(raw string, allowHTTP bool) (*url.URL, error) {
 	}
 	parsed.Path = ""
 	return parsed, nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

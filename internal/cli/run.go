@@ -14,7 +14,6 @@ import (
 
 	"github.com/openclaw/crawlkit/config"
 	"github.com/openclaw/crawlkit/control"
-	crawlstore "github.com/openclaw/crawlkit/store"
 
 	"github.com/adinvadim/exchangecrawl/internal/appconfig"
 	"github.com/adinvadim/exchangecrawl/internal/archive"
@@ -185,10 +184,8 @@ func runDoctor(ctx context.Context, stdout io.Writer, spec Spec, configPath stri
 	}
 	if _, err := os.Stat(cfg.DBPath); err == nil {
 		report.DatabasePresent = true
-		db, openErr := crawlstore.OpenReadOnly(ctx, cfg.DBPath)
-		if openErr == nil {
+		if checkErr := archive.CheckDatabase(ctx, cfg.DBPath); checkErr == nil {
 			report.DatabaseReady = true
-			_ = db.Close()
 		} else {
 			report.Ready = false
 		}
@@ -231,7 +228,7 @@ func runStatus(ctx context.Context, stdout io.Writer, spec Spec, configPath stri
 		AccountCount: len(cfg.Accounts),
 	}
 	if _, err := os.Stat(cfg.DBPath); err == nil {
-		arc, err := openArchive(ctx, cfg, adapter)
+		arc, err := openReadOnlyArchive(ctx, cfg, adapter)
 		if err != nil {
 			return err
 		}
@@ -434,7 +431,15 @@ func openExistingArchive(ctx context.Context, cfg appconfig.Config, adapter sour
 		}
 		return nil, err
 	}
-	return openArchive(ctx, cfg, adapter)
+	return openReadOnlyArchive(ctx, cfg, adapter)
+}
+
+func openReadOnlyArchive(ctx context.Context, cfg appconfig.Config, adapter source.Adapter) (*archive.Archive, error) {
+	return archive.OpenReadOnly(ctx, archive.Options{
+		Path:     cfg.DBPath,
+		Accounts: cfg.SourceAccounts(),
+		Adapter:  adapter,
+	})
 }
 
 func optionalTime(value string) (*time.Time, error) {

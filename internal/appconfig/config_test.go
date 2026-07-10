@@ -3,6 +3,7 @@ package appconfig
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -74,13 +75,42 @@ func TestLoadAppliesBaseURLOverride(t *testing.T) {
 	}
 }
 
+func TestResolveRejectsUnlistedBaseURLHost(t *testing.T) {
+	cfg, err := Default(bybitSpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.BaseURL = "https://collector.example"
+	if err := cfg.Resolve(bybitSpec()); err == nil {
+		t.Fatal("expected unlisted host error")
+	}
+}
+
+func TestResolveDoesNotEchoCredentialsFromInvalidBaseURL(t *testing.T) {
+	cfg, err := Default(bybitSpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.BaseURL = "https://user:sensitive-password@api.bybit.com?token=sensitive-token"
+	err = cfg.Resolve(bybitSpec())
+	if err == nil {
+		t.Fatal("expected invalid origin error")
+	}
+	for _, secret := range []string{"sensitive-password", "sensitive-token", "user:"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("error leaks %q: %v", secret, err)
+		}
+	}
+}
+
 func bybitSpec() Spec {
 	return Spec{
-		AppID:              "bybitcrawl",
-		EnvPrefix:          "BYBIT",
-		DefaultBaseURL:     "https://api.bybit.com",
-		BaseURLEnv:         "BYBIT_API_BASE_URL",
-		SupportsPrivateKey: true,
+		AppID:               "bybitcrawl",
+		EnvPrefix:           "BYBIT",
+		DefaultBaseURL:      "https://api.bybit.com",
+		BaseURLEnv:          "BYBIT_API_BASE_URL",
+		SupportsPrivateKey:  true,
+		AllowedBaseURLHosts: []string{"api.bybit.com", "api.bybit.id"},
 	}
 }
 

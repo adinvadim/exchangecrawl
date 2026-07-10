@@ -22,10 +22,11 @@ func main() {
 		AccentColor: "#F0B90B",
 		Version:     version,
 		Config: appconfig.Spec{
-			AppID:          "binancecrawl",
-			EnvPrefix:      "BINANCE",
-			DefaultBaseURL: "https://fapi.binance.com",
-			BaseURLEnv:     "BINANCE_FUTURES_BASE_URL",
+			AppID:               "binancecrawl",
+			EnvPrefix:           "BINANCE",
+			DefaultBaseURL:      "https://fapi.binance.com",
+			BaseURLEnv:          "BINANCE_FUTURES_BASE_URL",
+			AllowedBaseURLHosts: []string{"fapi.binance.com"},
 		},
 		NewAdapter: func(baseURL string) (source.Adapter, error) {
 			return binance.New(binance.Options{BaseURL: baseURL})

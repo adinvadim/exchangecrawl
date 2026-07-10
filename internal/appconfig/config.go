@@ -23,11 +23,12 @@ var (
 )
 
 type Spec struct {
-	AppID              string
-	EnvPrefix          string
-	DefaultBaseURL     string
-	BaseURLEnv         string
-	SupportsPrivateKey bool
+	AppID               string
+	EnvPrefix           string
+	DefaultBaseURL      string
+	BaseURLEnv          string
+	SupportsPrivateKey  bool
+	AllowedBaseURLHosts []string
 }
 
 type Config struct {
@@ -141,10 +142,16 @@ func (c *Config) Resolve(spec Spec) error {
 	c.DBPath = absolutePath(c.DBPath)
 	baseURL, err := url.Parse(strings.TrimSpace(c.BaseURL))
 	if err != nil || baseURL.Scheme != "https" || baseURL.Host == "" || baseURL.User != nil {
-		return fmt.Errorf("base_url must be an HTTPS origin: %q", c.BaseURL)
+		return errors.New("base_url must be an HTTPS origin")
 	}
 	if baseURL.Path != "" && baseURL.Path != "/" || baseURL.RawQuery != "" || baseURL.Fragment != "" {
-		return fmt.Errorf("base_url must be an HTTPS origin: %q", c.BaseURL)
+		return errors.New("base_url must be an HTTPS origin")
+	}
+	if baseURL.Port() != "" && baseURL.Port() != "443" {
+		return errors.New("base_url must use the default HTTPS port")
+	}
+	if !baseURLHostAllowed(spec, baseURL.Hostname()) {
+		return fmt.Errorf("base_url host is not allowed for %s", spec.AppID)
 	}
 	c.BaseURL = strings.TrimRight(baseURL.String(), "/")
 	lookback, err := time.ParseDuration(strings.TrimSpace(c.InitialLookback))
@@ -185,6 +192,20 @@ func (c *Config) Resolve(spec Spec) error {
 		}
 	}
 	return nil
+}
+
+func baseURLHostAllowed(spec Spec, host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	allowed := append([]string(nil), spec.AllowedBaseURLHosts...)
+	if parsed, err := url.Parse(spec.DefaultBaseURL); err == nil {
+		allowed = append(allowed, parsed.Hostname())
+	}
+	for _, candidate := range allowed {
+		if host == strings.ToLower(strings.TrimSpace(candidate)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c Config) SourceAccounts() []source.Account {

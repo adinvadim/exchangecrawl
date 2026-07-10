@@ -2,7 +2,9 @@ package archive
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -161,6 +163,7 @@ func (a *Archive) syncStart(ctx context.Context, accountID string, explicitSince
 func (a *Archive) syncWindow(ctx context.Context, account source.Account, start, end time.Time) (int, int, error) {
 	cursor := ""
 	seen := map[string]struct{}{"": {}}
+	seenPages := make(map[[sha256.Size]byte]struct{})
 	pages := 0
 	entries := 0
 	for pages < maxPagesPerWindow {
@@ -173,6 +176,11 @@ func (a *Archive) syncWindow(ctx context.Context, account source.Account, start,
 		if err != nil {
 			return pages, entries, fmt.Errorf("fetch page for %s: %w", account.ID, err)
 		}
+		fingerprint := pageIdentityFingerprint(page.Entries)
+		if _, duplicate := seenPages[fingerprint]; duplicate {
+			return pages, entries, errors.New("source repeated page content")
+		}
+		seenPages[fingerprint] = struct{}{}
 		if err := a.upsertPage(ctx, account, page.Entries); err != nil {
 			return pages, entries, err
 		}
@@ -194,6 +202,22 @@ func (a *Archive) syncWindow(ctx context.Context, account source.Account, start,
 		cursor = next
 	}
 	return pages, entries, fmt.Errorf("source exceeded %d pages in one window", maxPagesPerWindow)
+}
+
+func pageIdentityFingerprint(entries []model.LedgerEntry) [sha256.Size]byte {
+	hash := sha256.New()
+	var length [8]byte
+	binary.LittleEndian.PutUint64(length[:], uint64(len(entries)))
+	_, _ = hash.Write(length[:])
+	for _, entry := range entries {
+		id := strings.TrimSpace(entry.EntryID)
+		binary.LittleEndian.PutUint64(length[:], uint64(len(id)))
+		_, _ = hash.Write(length[:])
+		_, _ = hash.Write([]byte(id))
+	}
+	var fingerprint [sha256.Size]byte
+	copy(fingerprint[:], hash.Sum(nil))
+	return fingerprint
 }
 
 func (a *Archive) upsertPage(ctx context.Context, account source.Account, entries []model.LedgerEntry) error {

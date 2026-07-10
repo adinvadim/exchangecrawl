@@ -1,6 +1,7 @@
 package binance
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/adinvadim/exchangecrawl/internal/model"
 	"github.com/adinvadim/exchangecrawl/internal/source"
@@ -158,6 +160,194 @@ func TestFetchPageReturnsRedactedStructuredAPIError(t *testing.T) {
 	}
 }
 
+func TestFetchPageSanitizesRemoteErrorControlCharacters(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(response).Encode(map[string]any{
+			"code": -1022,
+			"msg":  "invalid\n\t\x1b[31m\u202erequest",
+		})
+	}))
+	t.Cleanup(server.Close)
+
+	fixedNow := time.UnixMilli(1_700_000_000_000).UTC()
+	adapter := newTestAdapter(t, server, fixedNow, map[string]string{
+		defaultAPIKeyEnv:    "api-key",
+		defaultAPISecretEnv: "api-secret",
+	})
+	_, err := adapter.FetchPage(t.Context(), source.PageRequest{
+		Account: source.Account{ID: "primary", Label: "Primary"},
+		Start:   fixedNow.Add(-time.Hour),
+		End:     fixedNow,
+	})
+	if err == nil {
+		t.Fatal("fetch page succeeded, want API error")
+	}
+	for _, r := range err.Error() {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+			t.Fatalf("error contains control character %U: %q", r, err)
+		}
+	}
+}
+
+func TestFetchPageRetriesTransientResponseWithFreshSignature(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.UnixMilli(1_700_000_000_000).UTC()
+	var requests atomic.Int32
+	timestamps := make(chan string, 2)
+	signatures := make(chan string, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		timestamps <- request.URL.Query().Get("timestamp")
+		signatures <- request.URL.Query().Get("signature")
+		if requests.Add(1) == 1 {
+			response.Header().Set("Retry-After", "2")
+			response.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(response).Encode(map[string]any{"code": -1003, "msg": "rate limited"})
+			return
+		}
+		_ = json.NewEncoder(response).Encode([]map[string]any{incomeFixture("retry-1", "1.0", "FUNDING_FEE")})
+	}))
+	t.Cleanup(server.Close)
+
+	var nowCalls atomic.Int64
+	sleeps := make(chan time.Duration, maxRetries)
+	adapter, err := New(Options{
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+		Now: func() time.Time {
+			return fixedNow.Add(time.Duration(nowCalls.Add(1)-1) * time.Second)
+		},
+		LookupEnv: mapLookup(map[string]string{
+			defaultAPIKeyEnv:    "api-key",
+			defaultAPISecretEnv: "api-secret",
+		}),
+		Sleep: func(ctx context.Context, duration time.Duration) error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				sleeps <- duration
+				return nil
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	page, err := adapter.FetchPage(t.Context(), source.PageRequest{
+		Account: source.Account{ID: "primary", Label: "Primary"},
+		Start:   fixedNow.Add(-time.Hour),
+		End:     fixedNow,
+	})
+	if err != nil {
+		t.Fatalf("fetch page: %v", err)
+	}
+	if len(page.Entries) != 1 || page.Entries[0].EntryID != "retry-1" {
+		t.Fatalf("entries = %#v", page.Entries)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("requests = %d, want 2", requests.Load())
+	}
+	if delay := <-sleeps; delay != 2*time.Second {
+		t.Fatalf("retry delay = %s, want 2s", delay)
+	}
+	firstTimestamp, secondTimestamp := <-timestamps, <-timestamps
+	if firstTimestamp == secondTimestamp {
+		t.Fatalf("retry reused timestamp %q", firstTimestamp)
+	}
+	firstSignature, secondSignature := <-signatures, <-signatures
+	if firstSignature == secondSignature {
+		t.Fatalf("retry reused signature %q", firstSignature)
+	}
+}
+
+func TestFetchPageDoesNotRetryPermanentClientError(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	var sleeps atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		response.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(response).Encode(map[string]any{"code": -1022, "msg": "bad signature"})
+	}))
+	t.Cleanup(server.Close)
+
+	fixedNow := time.UnixMilli(1_700_000_000_000).UTC()
+	adapter, err := New(Options{
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+		Now:        func() time.Time { return fixedNow },
+		LookupEnv: mapLookup(map[string]string{
+			defaultAPIKeyEnv:    "api-key",
+			defaultAPISecretEnv: "api-secret",
+		}),
+		Sleep: func(context.Context, time.Duration) error {
+			sleeps.Add(1)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	_, err = adapter.FetchPage(t.Context(), source.PageRequest{
+		Account: source.Account{ID: "primary", Label: "Primary"},
+		Start:   fixedNow.Add(-time.Hour),
+		End:     fixedNow,
+	})
+	if err == nil {
+		t.Fatal("fetch page succeeded, want API error")
+	}
+	if requests.Load() != 1 || sleeps.Load() != 0 {
+		t.Fatalf("requests = %d, sleeps = %d; want 1, 0", requests.Load(), sleeps.Load())
+	}
+}
+
+func TestFetchPageStopsAfterThreeRetries(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	var sleeps atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		response.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(response).Encode(map[string]any{"code": -1000, "msg": "unavailable"})
+	}))
+	t.Cleanup(server.Close)
+
+	fixedNow := time.UnixMilli(1_700_000_000_000).UTC()
+	adapter, err := New(Options{
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+		Now:        func() time.Time { return fixedNow },
+		LookupEnv: mapLookup(map[string]string{
+			defaultAPIKeyEnv:    "api-key",
+			defaultAPISecretEnv: "api-secret",
+		}),
+		Sleep: func(context.Context, time.Duration) error {
+			sleeps.Add(1)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	_, err = adapter.FetchPage(t.Context(), source.PageRequest{
+		Account: source.Account{ID: "primary", Label: "Primary"},
+		Start:   fixedNow.Add(-time.Hour),
+		End:     fixedNow,
+	})
+	if err == nil {
+		t.Fatal("fetch page succeeded, want API error")
+	}
+	if requests.Load() != maxRetries+1 || sleeps.Load() != maxRetries {
+		t.Fatalf("requests = %d, sleeps = %d; want %d, %d", requests.Load(), sleeps.Load(), maxRetries+1, maxRetries)
+	}
+}
+
 func TestFetchPageUsesDecimalCursorAndAdvancesFullPage(t *testing.T) {
 	t.Parallel()
 
@@ -238,6 +428,20 @@ func TestCheckCredentialsReportsOnlyEnvironmentVariableNames(t *testing.T) {
 	}
 	if len(status.Missing) != 1 || status.Missing[0] != "CUSTOM_SECRET" {
 		t.Fatalf("missing = %#v, want CUSTOM_SECRET", status.Missing)
+	}
+}
+
+func TestNewRejectsRemoteOrUninjectedPlainHTTP(t *testing.T) {
+	t.Parallel()
+
+	tests := []Options{
+		{BaseURL: "http://example.com", HTTPClient: &http.Client{}},
+		{BaseURL: "http://127.0.0.1:8080"},
+	}
+	for _, options := range tests {
+		if _, err := New(options); err == nil {
+			t.Errorf("New(%q) succeeded, want HTTP rejection", options.BaseURL)
+		}
 	}
 }
 

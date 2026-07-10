@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -336,6 +337,59 @@ func TestCheckCredentialsAcceptsHMACOrRSAWithoutExposingValues(t *testing.T) {
 	}
 }
 
+func TestCustomHMACAccountDoesNotInheritGlobalRSAPrivateKey(t *testing.T) {
+	t.Parallel()
+
+	const (
+		apiKey = "custom-api-key"
+		secret = "custom-api-secret"
+	)
+	requestTime := time.UnixMilli(1_700_000_123_456).UTC()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-BAPI-SIGN-TYPE"); got != "" {
+			t.Errorf("X-BAPI-SIGN-TYPE = %q, want HMAC", got)
+		}
+		wantSignature := hmacHex(secret, strconv.FormatInt(requestTime.UnixMilli(), 10)+apiKey+"5000"+r.URL.RawQuery)
+		assertHeader(t, r.Header, "X-BAPI-SIGN", wantSignature)
+		_, _ = fmt.Fprint(w, `{"retCode":0,"retMsg":"OK","result":{"nextPageCursor":"","list":[]}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	readFileCalled := false
+	adapter, err := New(Options{
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+		Now:        func() time.Time { return requestTime },
+		LookupEnv: mapLookup(map[string]string{
+			"CUSTOM_KEY":                 apiKey,
+			"CUSTOM_SECRET":              secret,
+			"BYBIT_API_PRIVATE_KEY_PATH": "/global/private.pem",
+		}),
+		ReadFile: func(string) ([]byte, error) {
+			readFileCalled = true
+			return nil, errors.New("must not read global RSA key")
+		},
+	})
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	account := source.Account{ID: "custom", APIKeyEnv: "CUSTOM_KEY", APISecretEnv: "CUSTOM_SECRET"}
+	if status := adapter.CheckCredentials(account); !status.Ready {
+		t.Fatalf("credential status = %#v, want ready", status)
+	}
+	_, err = adapter.FetchPage(context.Background(), source.PageRequest{
+		Account: account,
+		Start:   time.UnixMilli(1_700_000_000_000),
+		End:     time.UnixMilli(1_700_000_060_000),
+	})
+	if err != nil {
+		t.Fatalf("fetch page: %v", err)
+	}
+	if readFileCalled {
+		t.Fatal("custom HMAC account read the global RSA private key")
+	}
+}
+
 func TestNewRejectsPlainHTTPBaseURLFromEnvironment(t *testing.T) {
 	t.Parallel()
 
@@ -344,6 +398,32 @@ func TestNewRejectsPlainHTTPBaseURLFromEnvironment(t *testing.T) {
 	})})
 	if err == nil {
 		t.Fatal("new adapter accepted plaintext production base URL")
+	}
+}
+
+func TestNewAllowsPlainHTTPOnlyForInjectedLoopback(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		baseURL    string
+		httpClient *http.Client
+		wantError  bool
+	}{
+		{name: "injected IPv4 loopback", baseURL: "http://127.0.0.1:8080", httpClient: &http.Client{}},
+		{name: "injected localhost", baseURL: "http://localhost:8080", httpClient: &http.Client{}},
+		{name: "loopback without injected client", baseURL: "http://127.0.0.1:8080", wantError: true},
+		{name: "arbitrary host with injected client", baseURL: "http://api.bybit.test", httpClient: &http.Client{}, wantError: true},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := New(Options{BaseURL: test.baseURL, HTTPClient: test.httpClient})
+			if (err != nil) != test.wantError {
+				t.Fatalf("New() error = %v, wantError=%t", err, test.wantError)
+			}
+		})
 	}
 }
 
@@ -403,6 +483,165 @@ func TestFetchPageUsesInjectedRSAPrivateKey(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("fetch page: %v", err)
+	}
+}
+
+func TestFetchPageRetriesRateLimitsWithRetryAfterAndFreshSignature(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		firstReply func(http.ResponseWriter)
+	}{
+		{
+			name: "HTTP 429",
+			firstReply: func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = fmt.Fprint(w, `{"retCode":10006,"retMsg":"rate limit"}`)
+			},
+		},
+		{
+			name: "Bybit retCode 10006",
+			firstReply: func(w http.ResponseWriter) {
+				_, _ = fmt.Fprint(w, `{"retCode":10006,"retMsg":"rate limit","result":{}}`)
+			},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var attempts int
+			var timestamps, signatures []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts++
+				timestamps = append(timestamps, r.Header.Get("X-BAPI-TIMESTAMP"))
+				signatures = append(signatures, r.Header.Get("X-BAPI-SIGN"))
+				if attempts == 1 {
+					w.Header().Set("Retry-After", "2")
+					test.firstReply(w)
+					return
+				}
+				_, _ = fmt.Fprint(w, `{"retCode":0,"retMsg":"OK","result":{"nextPageCursor":"","list":[]}}`)
+			}))
+			t.Cleanup(server.Close)
+
+			baseTime := time.UnixMilli(1_700_000_123_456).UTC()
+			nowCalls := 0
+			var sleeps []time.Duration
+			adapter, err := New(Options{
+				BaseURL:    server.URL,
+				HTTPClient: server.Client(),
+				Now: func() time.Time {
+					result := baseTime.Add(time.Duration(nowCalls) * time.Second)
+					nowCalls++
+					return result
+				},
+				LookupEnv: mapLookup(map[string]string{"KEY": "api-key", "SECRET": "api-secret"}),
+				Sleep: func(ctx context.Context, delay time.Duration) error {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					sleeps = append(sleeps, delay)
+					return nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("new adapter: %v", err)
+			}
+			_, err = adapter.FetchPage(context.Background(), source.PageRequest{
+				Account: source.Account{ID: "main", APIKeyEnv: "KEY", APISecretEnv: "SECRET"},
+				Start:   time.UnixMilli(1_700_000_000_000),
+				End:     time.UnixMilli(1_700_000_060_000),
+			})
+			if err != nil {
+				t.Fatalf("fetch page: %v", err)
+			}
+			if attempts != 2 || !reflect.DeepEqual(sleeps, []time.Duration{2 * time.Second}) {
+				t.Fatalf("attempts/sleeps = %d/%v, want 2/[2s]", attempts, sleeps)
+			}
+			if len(timestamps) != 2 || timestamps[0] == timestamps[1] {
+				t.Fatalf("timestamps = %v, want fresh timestamp per attempt", timestamps)
+			}
+			if len(signatures) != 2 || signatures[0] == signatures[1] {
+				t.Fatalf("signatures = %v, want fresh signature per attempt", signatures)
+			}
+		})
+	}
+}
+
+func TestFetchPageBoundsRetryableResponsesToThreeRetries(t *testing.T) {
+	t.Parallel()
+
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Retry-After", "0")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+
+	var sleeps int
+	adapter, err := New(Options{
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+		LookupEnv:  mapLookup(map[string]string{"KEY": "api-key", "SECRET": "api-secret"}),
+		Sleep: func(context.Context, time.Duration) error {
+			sleeps++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	_, err = adapter.FetchPage(context.Background(), source.PageRequest{
+		Account: source.Account{ID: "main", APIKeyEnv: "KEY", APISecretEnv: "SECRET"},
+		Start:   time.UnixMilli(1_700_000_000_000),
+		End:     time.UnixMilli(1_700_000_060_000),
+	})
+	var httpError *HTTPError
+	if !errors.As(err, &httpError) || httpError.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("error = %T %v, want HTTP 503", err, err)
+	}
+	if attempts != maxRequestRetries+1 || sleeps != maxRequestRetries {
+		t.Fatalf("attempts/sleeps = %d/%d, want %d/%d", attempts, sleeps, maxRequestRetries+1, maxRequestRetries)
+	}
+}
+
+func TestFetchPageDoesNotRetryPermanentFailure(t *testing.T) {
+	t.Parallel()
+
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		_, _ = fmt.Fprint(w, `{"retCode":10003,"retMsg":"invalid key","result":{}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	adapter, err := New(Options{
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+		LookupEnv:  mapLookup(map[string]string{"KEY": "api-key", "SECRET": "api-secret"}),
+		Sleep: func(context.Context, time.Duration) error {
+			t.Fatal("permanent failure requested a retry sleep")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("new adapter: %v", err)
+	}
+	_, err = adapter.FetchPage(context.Background(), source.PageRequest{
+		Account: source.Account{ID: "main", APIKeyEnv: "KEY", APISecretEnv: "SECRET"},
+		Start:   time.UnixMilli(1_700_000_000_000),
+		End:     time.UnixMilli(1_700_000_060_000),
+	})
+	var apiError *APIError
+	if !errors.As(err, &apiError) || apiError.Code != 10003 {
+		t.Fatalf("error = %T %v, want API error 10003", err, err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
 	}
 }
 

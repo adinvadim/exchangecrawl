@@ -27,6 +27,12 @@ func main() {
 			DefaultBaseURL:     "https://api.bybit.com",
 			BaseURLEnv:         "BYBIT_API_BASE_URL",
 			SupportsPrivateKey: true,
+			AllowedBaseURLHosts: []string{
+				"api.bybit.com", "api.bytick.com", "api.bybit.id", "api.bybit.nl",
+				"api.bybit.tr", "api.bybit.kz", "api.bybitgeorgia.ge", "api.bybit.ae",
+				"api.bybit.eu", "api.moneypartners.co.jp", "api2.moneypartners.co.jp",
+				"api3.moneypartners.co.jp",
+			},
 		},
 		NewAdapter: func(baseURL string) (source.Adapter, error) {
 			return bybit.New(bybit.Options{BaseURL: baseURL})

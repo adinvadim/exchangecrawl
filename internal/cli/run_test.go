@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/openclaw/crawlkit/control"
+	"github.com/openclaw/crawlkit/store"
 
 	"github.com/adinvadim/exchangecrawl/internal/appconfig"
 	"github.com/adinvadim/exchangecrawl/internal/model"
@@ -87,6 +88,51 @@ func TestRunSyncThenEntriesReadsOnlyLocalArchive(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].EntryID != "entry-1" {
 		t.Fatalf("entries = %#v", entries)
+	}
+}
+
+func TestRunDoctorRejectsUnrelatedSQLite(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "unrelated.db")
+	db, err := store.Open(t.Context(), store.Options{
+		Path:          dbPath,
+		Schema:        `create table unrelated(id integer primary key);`,
+		SchemaVersion: 1,
+	})
+	if err != nil {
+		t.Fatalf("create unrelated SQLite: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close unrelated SQLite: %v", err)
+	}
+
+	spec := Spec{
+		ID:          "bybitcrawl",
+		DisplayName: "Bybit Crawl",
+		Config: appconfig.Spec{
+			AppID:          "bybitcrawl",
+			EnvPrefix:      "BYBIT",
+			DefaultBaseURL: "https://api.bybit.com",
+			BaseURLEnv:     "BYBIT_API_BASE_URL",
+		},
+		NewAdapter: func(string) (source.Adapter, error) { return &cliTestAdapter{}, nil },
+	}
+	var stdout bytes.Buffer
+	err = Run(t.Context(), []string{
+		"--config", filepath.Join(t.TempDir(), "missing.toml"),
+		"--db", dbPath,
+		"doctor", "--json",
+	}, &stdout, &bytes.Buffer{}, spec)
+	if err == nil {
+		t.Fatal("doctor accepted unrelated SQLite")
+	}
+	var report doctorReport
+	if decodeErr := json.Unmarshal(stdout.Bytes(), &report); decodeErr != nil {
+		t.Fatalf("decode doctor report: %v\n%s", decodeErr, stdout.String())
+	}
+	if !report.DatabasePresent || report.DatabaseReady || report.Ready {
+		t.Fatalf("doctor report = %#v, want present but unhealthy database", report)
 	}
 }
 
