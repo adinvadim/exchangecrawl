@@ -104,6 +104,8 @@ Binance scopes `tranId` by `incomeType` when deriving `entry_id`, matching the
 provider's uniqueness guarantee.
 SQLite uses WAL, file mode `0600`, schema versioning, deterministic query order,
 and FTS5 over searchable ledger text.
+Opening a writable schema-v1 Archive transactionally migrates legacy Binance
+identities to the scoped schema-v2 form before sync.
 
 ## Sync behavior
 

@@ -15,7 +15,7 @@ import (
 	"github.com/openclaw/crawlkit/store"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 type Options struct {
 	Path           string
@@ -54,13 +54,18 @@ func Open(ctx context.Context, options Options) (*Archive, error) {
 		db, err = store.OpenReadOnly(ctx, options.Path)
 	} else {
 		db, err = store.Open(ctx, store.Options{
-			Path:          options.Path,
-			Schema:        archiveSchema + state.Schema,
-			SchemaVersion: schemaVersion,
+			Path:   options.Path,
+			Schema: archiveSchema + state.Schema,
 		})
 	}
 	if err != nil {
 		return nil, fmt.Errorf("open Archive: %w", err)
+	}
+	if !options.ReadOnly {
+		if err := migrateSchema(ctx, db); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("open Archive: %w", err)
+		}
 	}
 	if options.ReadOnly {
 		if options.CheckIntegrity {
