@@ -6,6 +6,7 @@ create table if not exists ledger_entries (
   exchange text not null,
   account_id text not null,
   account_label text not null,
+  stream text not null default 'ledger',
   entry_id text not null,
   symbol text not null,
   category text not null,
@@ -34,6 +35,25 @@ create index if not exists idx_ledger_entries_symbol_order
   on ledger_entries(exchange, symbol, occurred_at desc, entry_id desc);
 create index if not exists idx_ledger_entries_type_order
   on ledger_entries(exchange, entry_type, occurred_at desc, entry_id desc);
+create table if not exists state_transitions (
+  id integer primary key,
+  exchange text not null,
+  account_id text not null,
+  stream text not null,
+  object_type text not null,
+  object_id text not null,
+  status text not null,
+  state_fingerprint text not null,
+  occurred_at integer,
+  observed_at integer not null,
+  raw_json text not null,
+  unique(exchange, account_id, object_type, object_id, observed_at, state_fingerprint)
+);
+
+create index if not exists idx_state_transitions_object
+  on state_transitions(exchange, account_id, object_type, object_id, observed_at desc);
+create index if not exists idx_state_transitions_stream
+  on state_transitions(exchange, stream, observed_at desc);
 
 create virtual table if not exists ledger_entries_fts using fts5(
   symbol,

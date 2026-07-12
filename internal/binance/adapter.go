@@ -199,8 +199,19 @@ func (a *Adapter) signedGET(
 	secret string,
 	out any,
 ) error {
-	for attempt := 0; ; attempt++ {
-		attemptedAt := a.now().UTC()
+	return a.signedGETOperation(ctx, path, query, apiKey, secret, "income", out)
+}
+
+func (a *Adapter) signedGETOperation(
+	ctx context.Context,
+	path string,
+	query url.Values,
+	apiKey string,
+	secret string,
+	operation string,
+	out any,
+) error {
+	return a.getJSON(ctx, operation, func(attemptedAt time.Time) (*http.Request, []string, error) {
 		query.Set("timestamp", strconv.FormatInt(attemptedAt.UnixMilli(), 10))
 		unsignedQuery := query.Encode()
 		signature := sign(secret, unsignedQuery)
@@ -210,18 +221,34 @@ func (a *Adapter) signedGET(
 
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 		if err != nil {
-			return &RequestError{Operation: "income"}
+			return nil, nil, err
 		}
 		request.Header.Set("Accept", "application/json")
 		request.Header.Set("User-Agent", "binancecrawl/0")
 		request.Header.Set("X-MBX-APIKEY", apiKey)
+		return request, []string{endpoint.String(), endpoint.RawQuery, apiKey, secret, signature}, nil
+	}, out)
+}
+
+func (a *Adapter) getJSON(
+	ctx context.Context,
+	operation string,
+	buildRequest func(time.Time) (*http.Request, []string, error),
+	out any,
+) error {
+	for attempt := 0; ; attempt++ {
+		attemptedAt := a.now().UTC()
+		request, sensitive, err := buildRequest(attemptedAt)
+		if err != nil {
+			return &RequestError{Operation: operation}
+		}
 
 		response, err := a.httpClient.Do(request)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			return &RequestError{Operation: "income"}
+			return &RequestError{Operation: operation}
 		}
 
 		body, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
@@ -229,15 +256,15 @@ func (a *Adapter) signedGET(
 		var responseErr error
 		switch {
 		case readErr != nil || len(body) > maxResponseBytes:
-			responseErr = &RequestError{Operation: "income response"}
+			responseErr = &RequestError{Operation: operation + " response"}
 		case response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices:
-			responseErr = decodeAPIError(response.StatusCode, body, endpoint.String(), endpoint.RawQuery, apiKey, secret, signature)
+			responseErr = decodeAPIError(response.StatusCode, body, sensitive...)
 		case json.Unmarshal(body, out) != nil:
 			var providerError apiErrorResponse
 			if json.Unmarshal(body, &providerError) == nil && providerError.Code != 0 {
-				responseErr = newAPIError(response.StatusCode, providerError, endpoint.String(), endpoint.RawQuery, apiKey, secret, signature)
+				responseErr = newAPIError(response.StatusCode, providerError, sensitive...)
 			} else {
-				responseErr = &RequestError{Operation: "income response decode"}
+				responseErr = &RequestError{Operation: operation + " response decode"}
 			}
 		default:
 			return nil
@@ -451,13 +478,13 @@ func envName(configured, fallback string) string {
 func parseBaseURL(raw string, allowLoopbackHTTP bool) (*url.URL, error) {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return nil, errors.New("Binance futures base URL must be an origin URL")
+		return nil, errors.New("Binance base URL must be an origin URL")
 	}
 	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && allowLoopbackHTTP && isLoopbackHost(parsed.Hostname())) {
-		return nil, errors.New("Binance futures base URL must use HTTPS")
+		return nil, errors.New("Binance base URL must use HTTPS")
 	}
 	if parsed.Path != "" && parsed.Path != "/" {
-		return nil, errors.New("Binance futures base URL must not contain a path")
+		return nil, errors.New("Binance base URL must not contain a path")
 	}
 	parsed.Path = ""
 	return parsed, nil

@@ -5,12 +5,44 @@ Local-first, read-only trading ledger archives built on
 
 This repository builds two independent applications:
 
-- `bybitcrawl` archives Bybit Unified Account transaction logs.
-- `binancecrawl` archives Binance USDⓈ-M Futures income history.
+- `bybitcrawl` archives Bybit Unified Account transaction logs plus spot,
+  derivatives, wallet, earn, and P2P history.
+- `binancecrawl` archives Binance USDⓈ-M Futures income history plus spot,
+  derivatives, wallet, Simple Earn, Auto-Invest, and C2C history.
 
 Each application keeps its own config and SQLite archive. Exchange credentials,
 signing, pagination, and response mapping stay in the Exchange adapter; archive
 storage, checkpoints, local queries, and control metadata are shared.
+
+## Coverage
+
+Beyond the base account ledger, each binary archives independently
+checkpointed streams. Immutable history is stored as append-only ledger
+entries; mutable objects (open orders, positions, running plans) are stored as
+append-only state observations queryable via `events`.
+
+`bybitcrawl`:
+
+- `ledger` — Unified Account transaction log
+- `spot/fills`, `spot/orders` — spot executions and order state
+- `futures/fills`, `futures/closed-pnl` — derivatives executions and realized PnL
+- `futures/orders`, `futures/positions` — derivatives order and position state
+- `asset/deposits`, `asset/withdrawals` — on-chain and internal wallet movements
+- `earn/orders`, `earn/yield` — earn subscriptions/redemptions and yield history
+- `p2p/orders` — P2P order history and state
+
+`binancecrawl`:
+
+- `ledger` — USDⓈ-M Futures income history
+- `spot/fills`, `spot/orders` — spot executions and order state
+- `futures/fills`, `futures/orders`, `futures/positions` — derivatives fills,
+  order state, and position state
+- `asset/deposits`, `asset/withdrawals` — wallet deposit and withdrawal history
+- `earn/orders`, `earn/rewards` — Simple Earn subscriptions/redemptions and rewards
+- `autoinvest/history`, `autoinvest/plans` — Auto-Invest executions and plan state
+- `p2p/orders` — C2C order history and state
+
+Every stream calls only official read/history endpoints.
 
 ## Development
 
@@ -56,10 +88,14 @@ go run ./cmd/binancecrawl search BTCUSDT --json
 explicit start, the first sync reads seven days and later syncs overlap the
 last successful checkpoint by 24 hours.
 
+`entries` and `search` accept `--stream` for local stream-scoped queries.
+`events` reads append-only mutable-object state transitions from the local
+archive and supports account, stream, object, status, and time filters.
+
 ## Local-first and read-only
 
 - ExchangeCrawl calls only official read endpoints.
-- `entries`, `search`, and `status` use only local SQLite data.
+- `entries`, `events`, `search`, and `status` use only local SQLite data.
 - Config stores environment-variable names, never secret values.
 - API keys, secrets, signed URLs, and private keys are never stored in the
   archive or emitted in command output.

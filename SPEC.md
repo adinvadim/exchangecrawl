@@ -19,8 +19,22 @@ Archive the account ledger through official read-only endpoints:
 - Bybit V5 `GET /v5/account/transaction-log`
 - Binance USDⓈ-M Futures `GET /fapi/v1/income`
 
-Deferred: orders, fills, balances, positions, TUI, snapshot sharing, remote
-archives, and Exchange write actions.
+In addition to the base ledger, each binary archives independently
+checkpointed streams through official read/history endpoints only. Immutable
+history is normalized to ledger entries; mutable objects are normalized to
+append-only state observations.
+
+- Spot: fills and order state (both binaries).
+- Derivatives: fills, order state, and position state (both binaries); closed
+  PnL on Bybit.
+- Wallet: deposit and withdrawal history (both binaries).
+- Earn: Bybit earn orders and yield history; Binance Simple Earn
+  subscriptions/redemptions and rewards.
+- Auto-Invest: Binance execution history and plan state.
+- P2P: Bybit P2P and Binance C2C order history and state.
+
+Deferred: balances, TUI, snapshot sharing, remote archives, and Exchange write
+actions.
 
 ## CLI interface
 

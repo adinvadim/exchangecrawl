@@ -1,7 +1,8 @@
 /bin/
 /dist/
+/binancecrawl
+/bybitcrawl
 /*.db
 /*.db-shm
 /*.db-wal
 .DS_Store
-

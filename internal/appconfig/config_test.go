@@ -75,6 +75,24 @@ func TestLoadAppliesBaseURLOverride(t *testing.T) {
 	}
 }
 
+func TestLoadStreamDefaultsToEnabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[streams.spot]\ninitial_lookback = \"12h\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := Load(bybitSpec(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, ok := cfg.Streams["spot"]
+	if !ok {
+		t.Fatalf("Streams = %#v", cfg.Streams)
+	}
+	if !stream.IsEnabled() {
+		t.Fatal("stream with omitted enabled field is disabled")
+	}
+}
+
 func TestResolveRejectsUnlistedBaseURLHost(t *testing.T) {
 	cfg, err := Default(bybitSpec())
 	if err != nil {

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/openclaw/crawlkit/control"
@@ -26,6 +27,12 @@ func TestControlManifestKeepsCrawlerIdentityAndReadOnlyQueries(t *testing.T) {
 	}
 	if manifest.Commands["entries"].Mutates {
 		t.Fatal("entries command must be read-only")
+	}
+	if manifest.Commands["events"].Mutates {
+		t.Fatal("events command must be read-only")
+	}
+	if !slices.Contains(manifest.Capabilities, "events") {
+		t.Fatalf("manifest capabilities = %#v, want events", manifest.Capabilities)
 	}
 	if manifest.Privacy.ExportsSecrets {
 		t.Fatal("manifest must state that secrets are not exported")

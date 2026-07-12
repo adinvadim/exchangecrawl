@@ -13,10 +13,16 @@ var requiredSchemaQueries = []struct {
 }{
 	{
 		name: "ledger_entries",
-		query: `select exchange, account_id, account_label, entry_id, symbol,
+		query: `select exchange, account_id, account_label, stream, entry_id, symbol,
 category, entry_type, asset, side, amount, fee, funding, cash_flow, balance,
 order_id, trade_id, info, occurred_at, observed_at, raw_json
 from ledger_entries where 0`,
+	},
+	{
+		name: "state_transitions",
+		query: `select exchange, account_id, stream, object_type, object_id, status,
+state_fingerprint, occurred_at, observed_at, raw_json
+from state_transitions where 0`,
 	},
 	{
 		name: "ledger_entries_fts",

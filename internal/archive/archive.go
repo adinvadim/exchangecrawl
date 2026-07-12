@@ -15,28 +15,30 @@ import (
 	"github.com/openclaw/crawlkit/store"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 type Options struct {
 	Path           string
 	Accounts       []source.Account
-	Adapter        source.Adapter
+	Streams        []source.StreamBinding
 	Now            func() time.Time
 	ReadOnly       bool
 	CheckIntegrity bool
 }
 
 type Archive struct {
-	store    *store.Store
-	state    *state.Store
-	adapter  source.Adapter
-	accounts []source.Account
-	now      func() time.Time
+	store          *store.Store
+	state          *state.Store
+	streams        []source.StreamBinding
+	sourceExchange model.Exchange
+	accounts       []source.Account
+	now            func() time.Time
 }
 
 func Open(ctx context.Context, options Options) (*Archive, error) {
-	if options.Adapter == nil {
-		return nil, errors.New("source adapter is required")
+	streams, exchange, err := validateStreams(options.Streams)
+	if err != nil {
+		return nil, err
 	}
 	if len(options.Accounts) == 0 {
 		return nil, errors.New("at least one Connected Account is required")
@@ -49,7 +51,6 @@ func Open(ctx context.Context, options Options) (*Archive, error) {
 		now = time.Now
 	}
 	var db *store.Store
-	var err error
 	if options.ReadOnly {
 		db, err = store.OpenReadOnly(ctx, options.Path)
 	} else {
@@ -79,12 +80,65 @@ func Open(ctx context.Context, options Options) (*Archive, error) {
 		}
 	}
 	return &Archive{
-		store:    db,
-		state:    state.NewWithClock(db.DB(), now),
-		adapter:  options.Adapter,
-		accounts: append([]source.Account(nil), options.Accounts...),
-		now:      now,
+		store:          db,
+		state:          state.NewWithClock(db.DB(), now),
+		streams:        streams,
+		sourceExchange: exchange,
+		accounts:       append([]source.Account(nil), options.Accounts...),
+		now:            now,
 	}, nil
+}
+
+func validateStreams(streams []source.StreamBinding) ([]source.StreamBinding, model.Exchange, error) {
+	if len(streams) == 0 {
+		return nil, "", errors.New("at least one source stream is required")
+	}
+	validated := append([]source.StreamBinding(nil), streams...)
+	seen := make(map[string]struct{}, len(streams))
+	var exchange model.Exchange
+	for index, binding := range validated {
+		name := strings.TrimSpace(binding.Name)
+		if name == "" {
+			return nil, "", fmt.Errorf("source stream %d name is required", index)
+		}
+		if name != binding.Name {
+			return nil, "", fmt.Errorf("source stream name %q must be trimmed", binding.Name)
+		}
+		if _, ok := seen[name]; ok {
+			return nil, "", fmt.Errorf("duplicate source stream name %q", name)
+		}
+		seen[name] = struct{}{}
+		stream := strings.TrimSpace(binding.Stream)
+		if stream == "" {
+			return nil, "", fmt.Errorf("source stream %q storage stream is required", name)
+		}
+		if stream != binding.Stream {
+			return nil, "", fmt.Errorf("source stream %q storage stream must be trimmed", name)
+		}
+		if (binding.Adapter == nil) == (binding.Events == nil) {
+			return nil, "", fmt.Errorf("source stream %q must configure exactly one adapter kind", name)
+		}
+		if binding.InitialLookback < 0 || binding.CheckpointOverlap < 0 || binding.MaxWindow < 0 {
+			return nil, "", fmt.Errorf("source stream %q durations must not be negative", name)
+		}
+		bindingExchange := streamExchange(binding)
+		if bindingExchange == "" {
+			return nil, "", fmt.Errorf("source stream %q Exchange is required", name)
+		}
+		if exchange == "" {
+			exchange = bindingExchange
+		} else if bindingExchange != exchange {
+			return nil, "", fmt.Errorf("source stream %q Exchange %q does not match %q", name, bindingExchange, exchange)
+		}
+	}
+	return validated, exchange, nil
+}
+
+func streamExchange(binding source.StreamBinding) model.Exchange {
+	if binding.Adapter != nil {
+		return binding.Adapter.Exchange()
+	}
+	return binding.Events.Exchange()
 }
 
 func (a *Archive) Close() error {
@@ -116,5 +170,5 @@ func validateAccounts(accounts []source.Account) error {
 }
 
 func (a *Archive) exchange() model.Exchange {
-	return a.adapter.Exchange()
+	return a.sourceExchange
 }

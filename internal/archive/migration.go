@@ -27,15 +27,21 @@ func migrateSchema(ctx context.Context, db *store.Store) error {
 		if current == schemaVersion {
 			return nil
 		}
-		switch current {
-		case 0:
-			// New Archive: the current schema was created by store.Open.
-		case 1:
-			if err := migrateBinanceEntryIDs(ctx, tx); err != nil {
-				return fmt.Errorf("migrate Archive schema 1 to 2: %w", err)
+		for version := current; version < schemaVersion; version++ {
+			switch version {
+			case 0:
+				// New Archive: the current schema was created by store.Open.
+			case 1:
+				if err := migrateBinanceEntryIDs(ctx, tx); err != nil {
+					return fmt.Errorf("migrate Archive schema 1 to 2: %w", err)
+				}
+			case 2:
+				if err := migrateV2ToV3(ctx, tx); err != nil {
+					return fmt.Errorf("migrate Archive schema 2 to 3: %w", err)
+				}
+			default:
+				return fmt.Errorf("unsupported Archive schema version %d", version)
 			}
-		default:
-			return fmt.Errorf("unsupported Archive schema version %d", current)
 		}
 		if _, err := tx.ExecContext(ctx, `delete from schema_migrations`); err != nil {
 			return fmt.Errorf("clear Archive schema version: %w", err)
@@ -45,6 +51,57 @@ func migrateSchema(ctx context.Context, db *store.Store) error {
 		}
 		return nil
 	})
+}
+
+func migrateV2ToV3(ctx context.Context, tx *sql.Tx) error {
+	hasStream, err := ledgerEntriesHaveStream(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if !hasStream {
+		if _, err := tx.ExecContext(ctx, `alter table ledger_entries add column stream text not null default 'ledger'`); err != nil {
+			return fmt.Errorf("add Ledger Entry stream: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `create index if not exists idx_ledger_entries_stream_order
+on ledger_entries(exchange, stream, occurred_at desc)`); err != nil {
+		return fmt.Errorf("index Ledger Entry streams: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+insert into sync_state(source_name, entity_type, entity_id, value, updated_at)
+select source_name, 'ledger', entity_id, value, updated_at
+from sync_state
+where entity_type = 'account'
+on conflict(source_name, entity_type, entity_id) do nothing`); err != nil {
+		return fmt.Errorf("copy legacy Checkpoints: %w", err)
+	}
+	return nil
+}
+
+func ledgerEntriesHaveStream(ctx context.Context, tx *sql.Tx) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `pragma table_info(ledger_entries)`)
+	if err != nil {
+		return false, fmt.Errorf("inspect Ledger Entry columns: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name string
+		var dataType string
+		var notNull int
+		var defaultValue any
+		var primaryKey int
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, fmt.Errorf("inspect Ledger Entry columns: %w", err)
+		}
+		if name == "stream" {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("inspect Ledger Entry columns: %w", err)
+	}
+	return false, nil
 }
 
 type binanceMigrationRow struct {

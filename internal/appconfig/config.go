@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,11 +33,23 @@ type Spec struct {
 }
 
 type Config struct {
-	Version         int             `toml:"version" json:"version"`
-	DBPath          string          `toml:"db_path" json:"db_path"`
-	BaseURL         string          `toml:"base_url" json:"base_url"`
-	InitialLookback string          `toml:"initial_lookback" json:"initial_lookback"`
-	Accounts        []AccountConfig `toml:"accounts" json:"accounts"`
+	Version         int                     `toml:"version" json:"version"`
+	DBPath          string                  `toml:"db_path" json:"db_path"`
+	BaseURL         string                  `toml:"base_url" json:"base_url"`
+	InitialLookback string                  `toml:"initial_lookback" json:"initial_lookback"`
+	Accounts        []AccountConfig         `toml:"accounts" json:"accounts"`
+	Streams         map[string]StreamConfig `toml:"streams,omitempty" json:"streams,omitempty"`
+}
+
+type StreamConfig struct {
+	Enabled           *bool  `toml:"enabled,omitempty" json:"enabled,omitempty"`
+	InitialLookback   string `toml:"initial_lookback,omitempty" json:"initial_lookback,omitempty"`
+	CheckpointOverlap string `toml:"checkpoint_overlap,omitempty" json:"checkpoint_overlap,omitempty"`
+	MaxWindow         string `toml:"max_window,omitempty" json:"max_window,omitempty"`
+}
+
+func (c StreamConfig) IsEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
 }
 
 type AccountConfig struct {
@@ -158,6 +171,27 @@ func (c *Config) Resolve(spec Spec) error {
 	if err != nil || lookback <= 0 {
 		return fmt.Errorf("initial_lookback must be a positive duration: %q", c.InitialLookback)
 	}
+	streamNames := make([]string, 0, len(c.Streams))
+	for name := range c.Streams {
+		streamNames = append(streamNames, name)
+	}
+	sort.Strings(streamNames)
+	for _, name := range streamNames {
+		stream := c.Streams[name]
+		if err := validateStreamDuration(name, "initial_lookback", stream.InitialLookback); err != nil {
+			return err
+		}
+		if err := validateStreamDuration(name, "checkpoint_overlap", stream.CheckpointOverlap); err != nil {
+			return err
+		}
+		if err := validateStreamDuration(name, "max_window", stream.MaxWindow); err != nil {
+			return err
+		}
+		stream.InitialLookback = strings.TrimSpace(stream.InitialLookback)
+		stream.CheckpointOverlap = strings.TrimSpace(stream.CheckpointOverlap)
+		stream.MaxWindow = strings.TrimSpace(stream.MaxWindow)
+		c.Streams[name] = stream
+	}
 	if len(c.Accounts) == 0 {
 		return errors.New("at least one account is required")
 	}
@@ -190,6 +224,18 @@ func (c *Config) Resolve(spec Spec) error {
 				return fmt.Errorf("account %s: %w", account.ID, err)
 			}
 		}
+	}
+	return nil
+}
+
+func validateStreamDuration(streamName, field, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration < 0 {
+		return fmt.Errorf("stream %q %s must be a non-negative duration: %q", streamName, field, value)
 	}
 	return nil
 }

@@ -1,6 +1,7 @@
 package bybit
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -152,10 +153,6 @@ func (a *Adapter) FetchPage(ctx context.Context, request source.PageRequest) (so
 	if err := validatePageRequest(request); err != nil {
 		return source.Page{}, err
 	}
-	credentials, err := a.resolveCredentials(request.Account)
-	if err != nil {
-		return source.Page{}, err
-	}
 	query := url.Values{
 		"accountType": {"UNIFIED"},
 		"startTime":   {strconv.FormatInt(request.Start.UnixMilli(), 10)},
@@ -165,6 +162,35 @@ func (a *Adapter) FetchPage(ctx context.Context, request source.PageRequest) (so
 	if request.Cursor != "" {
 		query.Set("cursor", request.Cursor)
 	}
+	result, observedAt, err := a.fetchResult(ctx, request.Account, transactionLogPath, query)
+	if err != nil {
+		return source.Page{}, err
+	}
+	var page transactionLogResult
+	if err := json.Unmarshal(result, &page); err != nil {
+		return source.Page{}, errors.New("decode Bybit response result")
+	}
+	entries := make([]model.LedgerEntry, 0, len(page.List))
+	for _, raw := range page.List {
+		entry, err := normalizeEntry(raw, request.Account, observedAt)
+		if err != nil {
+			return source.Page{}, err
+		}
+		entries = append(entries, entry)
+	}
+	return source.Page{Entries: entries, NextCursor: page.NextPageCursor, Done: page.NextPageCursor == ""}, nil
+}
+
+func (a *Adapter) fetchResult(
+	ctx context.Context,
+	account source.Account,
+	path string,
+	query url.Values,
+) (json.RawMessage, time.Time, error) {
+	credentials, err := a.resolveCredentials(account)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
 	encodedQuery := query.Encode()
 
 	for attempt := 0; attempt <= maxRequestRetries; attempt++ {
@@ -173,15 +199,15 @@ func (a *Adapter) FetchPage(ctx context.Context, request source.PageRequest) (so
 		payload := timestamp + credentials.apiKey + strconv.Itoa(a.recvWindow) + encodedQuery
 		signature, signType, err := credentials.signer.sign(payload)
 		if err != nil {
-			return source.Page{}, err
+			return nil, time.Time{}, err
 		}
 
 		requestURL := *a.baseURL
-		requestURL.Path = transactionLogPath
+		requestURL.Path = path
 		requestURL.RawQuery = encodedQuery
 		httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL.String(), nil)
 		if err != nil {
-			return source.Page{}, errors.New("build Bybit request")
+			return nil, time.Time{}, errors.New("build Bybit request")
 		}
 		httpRequest.Header.Set("Accept", "application/json")
 		httpRequest.Header.Set("User-Agent", "exchangecrawl/0")
@@ -196,71 +222,154 @@ func (a *Adapter) FetchPage(ctx context.Context, request source.PageRequest) (so
 		response, err := a.httpClient.Do(httpRequest)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return source.Page{}, ctxErr
+				return nil, time.Time{}, ctxErr
 			}
-			return source.Page{}, errors.New("send Bybit request: transport failed")
+			return nil, time.Time{}, errors.New("send Bybit request: transport failed")
 		}
 		body, readErr := readResponseBody(response.Body)
 		_ = response.Body.Close()
 		if readErr != nil {
-			return source.Page{}, readErr
+			return nil, time.Time{}, readErr
 		}
 
 		if response.StatusCode == http.StatusTooManyRequests ||
 			(response.StatusCode >= http.StatusInternalServerError && response.StatusCode < 600) {
 			if attempt < maxRequestRetries {
 				if err := a.waitBeforeRetry(ctx, response.Header.Get("Retry-After"), observedAt, attempt); err != nil {
-					return source.Page{}, err
+					return nil, time.Time{}, err
 				}
 				continue
 			}
-			return source.Page{}, &HTTPError{StatusCode: response.StatusCode}
+			return nil, time.Time{}, &HTTPError{StatusCode: response.StatusCode}
 		}
 		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-			return source.Page{}, &HTTPError{StatusCode: response.StatusCode}
+			return nil, time.Time{}, &HTTPError{StatusCode: response.StatusCode}
 		}
 
-		var envelope transactionLogEnvelope
+		var envelope bybitEnvelope
 		if err := json.Unmarshal(body, &envelope); err != nil {
-			return source.Page{}, errors.New("decode Bybit response")
+			return nil, time.Time{}, errors.New("decode Bybit response")
 		}
 		if envelope.RetCode == nil {
-			return source.Page{}, errors.New("decode Bybit response: missing retCode")
+			return nil, time.Time{}, errors.New("decode Bybit response: missing retCode")
 		}
 		if *envelope.RetCode == 10006 && attempt < maxRequestRetries {
 			if err := a.waitBeforeRetry(ctx, response.Header.Get("Retry-After"), observedAt, attempt); err != nil {
-				return source.Page{}, err
+				return nil, time.Time{}, err
 			}
 			continue
 		}
 		if *envelope.RetCode != 0 {
 			redactions := append([]string(nil), credentials.redactions...)
 			redactions = append(redactions, signature, requestURL.String(), requestURL.RequestURI())
-			return source.Page{}, &APIError{
+			return nil, time.Time{}, &APIError{
 				Code:    *envelope.RetCode,
 				Message: sanitizeRemoteMessage(envelope.RetMsg, redactions...),
 			}
 		}
-		if envelope.Result == nil {
-			return source.Page{}, errors.New("decode Bybit response: missing result")
+		if len(envelope.Result) == 0 || string(envelope.Result) == "null" {
+			return nil, time.Time{}, errors.New("decode Bybit response: missing result")
+		}
+		return append(json.RawMessage(nil), envelope.Result...), observedAt, nil
+	}
+	return nil, time.Time{}, errors.New("Bybit request exhausted retries")
+}
+
+// fetchResultPOST signs and sends a Bybit V5 POST body request. It reuses the
+// exact signing, retry, and redaction path as fetchResult; the only V5
+// difference is that the signature covers the raw JSON body instead of the
+// query string, so signed POST endpoints (P2P) never fork the signing code.
+func (a *Adapter) fetchResultPOST(
+	ctx context.Context,
+	account source.Account,
+	path string,
+	body []byte,
+) (json.RawMessage, time.Time, error) {
+	credentials, err := a.resolveCredentials(account)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+
+	for attempt := 0; attempt <= maxRequestRetries; attempt++ {
+		observedAt := a.now().UTC()
+		timestamp := strconv.FormatInt(observedAt.UnixMilli(), 10)
+		payload := timestamp + credentials.apiKey + strconv.Itoa(a.recvWindow) + string(body)
+		signature, signType, err := credentials.signer.sign(payload)
+		if err != nil {
+			return nil, time.Time{}, err
 		}
 
-		entries := make([]model.LedgerEntry, 0, len(envelope.Result.List))
-		for _, raw := range envelope.Result.List {
-			entry, err := normalizeEntry(raw, request.Account, observedAt)
-			if err != nil {
-				return source.Page{}, err
-			}
-			entries = append(entries, entry)
+		requestURL := *a.baseURL
+		requestURL.Path = path
+		httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bytes.NewReader(body))
+		if err != nil {
+			return nil, time.Time{}, errors.New("build Bybit request")
 		}
-		nextCursor := envelope.Result.NextPageCursor
-		return source.Page{
-			Entries:    entries,
-			NextCursor: nextCursor,
-			Done:       nextCursor == "",
-		}, nil
+		httpRequest.Header.Set("Accept", "application/json")
+		httpRequest.Header.Set("Content-Type", "application/json")
+		httpRequest.Header.Set("User-Agent", "exchangecrawl/0")
+		httpRequest.Header.Set("X-BAPI-API-KEY", credentials.apiKey)
+		httpRequest.Header.Set("X-BAPI-TIMESTAMP", timestamp)
+		httpRequest.Header.Set("X-BAPI-RECV-WINDOW", strconv.Itoa(a.recvWindow))
+		httpRequest.Header.Set("X-BAPI-SIGN", signature)
+		if signType != "" {
+			httpRequest.Header.Set("X-BAPI-SIGN-TYPE", signType)
+		}
+
+		response, err := a.httpClient.Do(httpRequest)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, time.Time{}, ctxErr
+			}
+			return nil, time.Time{}, errors.New("send Bybit request: transport failed")
+		}
+		responseBody, readErr := readResponseBody(response.Body)
+		_ = response.Body.Close()
+		if readErr != nil {
+			return nil, time.Time{}, readErr
+		}
+
+		if response.StatusCode == http.StatusTooManyRequests ||
+			(response.StatusCode >= http.StatusInternalServerError && response.StatusCode < 600) {
+			if attempt < maxRequestRetries {
+				if err := a.waitBeforeRetry(ctx, response.Header.Get("Retry-After"), observedAt, attempt); err != nil {
+					return nil, time.Time{}, err
+				}
+				continue
+			}
+			return nil, time.Time{}, &HTTPError{StatusCode: response.StatusCode}
+		}
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+			return nil, time.Time{}, &HTTPError{StatusCode: response.StatusCode}
+		}
+
+		var envelope bybitEnvelope
+		if err := json.Unmarshal(responseBody, &envelope); err != nil {
+			return nil, time.Time{}, errors.New("decode Bybit response")
+		}
+		if envelope.RetCode == nil {
+			return nil, time.Time{}, errors.New("decode Bybit response: missing retCode")
+		}
+		if *envelope.RetCode == 10006 && attempt < maxRequestRetries {
+			if err := a.waitBeforeRetry(ctx, response.Header.Get("Retry-After"), observedAt, attempt); err != nil {
+				return nil, time.Time{}, err
+			}
+			continue
+		}
+		if *envelope.RetCode != 0 {
+			redactions := append([]string(nil), credentials.redactions...)
+			redactions = append(redactions, signature, requestURL.String(), requestURL.RequestURI())
+			return nil, time.Time{}, &APIError{
+				Code:    *envelope.RetCode,
+				Message: sanitizeRemoteMessage(envelope.RetMsg, redactions...),
+			}
+		}
+		if len(envelope.Result) == 0 || string(envelope.Result) == "null" {
+			return nil, time.Time{}, errors.New("decode Bybit response: missing result")
+		}
+		return append(json.RawMessage(nil), envelope.Result...), observedAt, nil
 	}
-	return source.Page{}, errors.New("Bybit request exhausted retries")
+	return nil, time.Time{}, errors.New("Bybit request exhausted retries")
 }
 
 type resolvedCredentials struct {
@@ -334,10 +443,10 @@ func (a *Adapter) resolveCredentials(account source.Account) (resolvedCredential
 	}, nil
 }
 
-type transactionLogEnvelope struct {
-	RetCode *int                  `json:"retCode"`
-	RetMsg  string                `json:"retMsg"`
-	Result  *transactionLogResult `json:"result"`
+type bybitEnvelope struct {
+	RetCode *int            `json:"retCode"`
+	RetMsg  string          `json:"retMsg"`
+	Result  json.RawMessage `json:"result"`
 }
 
 type transactionLogResult struct {

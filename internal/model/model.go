@@ -37,3 +37,22 @@ type LedgerEntry struct {
 	ObservedAt   time.Time       `json:"observed_at"`
 	RawJSON      json.RawMessage `json:"raw_json"`
 }
+
+// StateObservation is one observed state of a mutable Exchange object.
+// Decimal values remain strings so archiving never loses provider precision.
+type StateObservation struct {
+	Exchange         Exchange        `json:"exchange"`
+	AccountID        string          `json:"account_id"`
+	AccountLabel     string          `json:"account_label"`
+	Stream           string          `json:"stream"`
+	ObjectType       string          `json:"object_type"`
+	ObjectID         string          `json:"object_id"`
+	Status           string          `json:"status"`
+	StateFingerprint string          `json:"state_fingerprint"`
+	Symbol           string          `json:"symbol"`
+	Asset            string          `json:"asset"`
+	Amount           string          `json:"amount"`
+	OccurredAt       time.Time       `json:"occurred_at,omitempty"`
+	ObservedAt       time.Time       `json:"observed_at"`
+	RawJSON          json.RawMessage `json:"raw_json"`
+}

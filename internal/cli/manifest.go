@@ -15,7 +15,7 @@ type Spec struct {
 	AccentColor string
 	Version     string
 	Config      appconfig.Spec
-	NewAdapter  func(baseURL string) (source.Adapter, error)
+	NewStreams  func(baseURL string) ([]source.StreamBinding, error)
 }
 
 func controlManifest(spec Spec, paths control.Paths) control.Manifest {
@@ -26,7 +26,7 @@ func controlManifest(spec Spec, paths control.Paths) control.Manifest {
 		AccentColor: spec.AccentColor,
 	}
 	manifest.Paths = paths
-	manifest.Capabilities = []string{"metadata", "status", "doctor", "sync", "entries", "search"}
+	manifest.Capabilities = []string{"metadata", "status", "doctor", "sync", "entries", "events", "search"}
 	manifest.Privacy = control.Privacy{
 		ContainsPrivateMessages: false,
 		ExportsSecrets:          false,
@@ -37,6 +37,7 @@ func controlManifest(spec Spec, paths control.Paths) control.Manifest {
 		"doctor":  {Title: "Doctor", Argv: []string{spec.ID, "doctor", "--json"}, JSON: true},
 		"sync":    {Title: "Sync ledger", Argv: []string{spec.ID, "sync", "--json"}, JSON: true, Mutates: true},
 		"entries": {Title: "Recent ledger entries", Argv: []string{spec.ID, "entries", "--json"}, JSON: true},
+		"events":  {Title: "Recent state transitions", Argv: []string{spec.ID, "events", "--json"}, JSON: true},
 	}
 	return manifest
 }

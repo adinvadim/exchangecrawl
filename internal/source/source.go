@@ -35,9 +35,33 @@ type Page struct {
 	Done       bool
 }
 
+type EventPage struct {
+	Observations []model.StateObservation
+	NextCursor   string
+	Done         bool
+}
+
 // Adapter is the true-external seam implemented by each Exchange source.
 type Adapter interface {
 	Exchange() model.Exchange
 	CheckCredentials(Account) CredentialStatus
 	FetchPage(context.Context, PageRequest) (Page, error)
+}
+
+// EventAdapter is the true-external seam for mutable Exchange objects.
+type EventAdapter interface {
+	Exchange() model.Exchange
+	CheckCredentials(Account) CredentialStatus
+	FetchEventPage(context.Context, PageRequest) (EventPage, error)
+}
+
+// StreamBinding configures one independently checkpointed source stream.
+type StreamBinding struct {
+	Name              string
+	Stream            string
+	Adapter           Adapter
+	Events            EventAdapter
+	InitialLookback   time.Duration
+	CheckpointOverlap time.Duration
+	MaxWindow         time.Duration
 }

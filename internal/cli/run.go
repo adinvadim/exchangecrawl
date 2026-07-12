@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -87,25 +88,38 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, spec Spec
 			return err
 		}
 	}
-	if spec.NewAdapter == nil {
-		return errors.New("crawler source adapter factory is required")
+	if spec.NewStreams == nil {
+		return errors.New("crawler source stream factory is required")
 	}
-	adapter, err := spec.NewAdapter(cfg.BaseURL)
+	availableStreams, err := spec.NewStreams(cfg.BaseURL)
 	if err != nil {
 		return err
 	}
+	if len(availableStreams) == 0 {
+		return errors.New("crawler source stream registry is empty")
+	}
+	streams, streamStatuses, streamWarnings := configureStreams(availableStreams, cfg.Streams)
+	for _, warning := range streamWarnings {
+		fmt.Fprintln(stderr, warning)
+	}
+	if command == "doctor" {
+		return runDoctor(ctx, stdout, spec, resolvedConfigPath, cfg, streams, streamStatuses, commandArgs)
+	}
+	if len(streams) == 0 {
+		return errors.New("all source streams are disabled")
+	}
 
 	switch command {
-	case "doctor":
-		return runDoctor(ctx, stdout, spec, resolvedConfigPath, cfg, adapter, commandArgs)
 	case "status":
-		return runStatus(ctx, stdout, spec, resolvedConfigPath, cfg, adapter, commandArgs)
+		return runStatus(ctx, stdout, spec, resolvedConfigPath, cfg, streams, commandArgs)
 	case "sync":
-		return runSync(ctx, stdout, cfg, adapter, commandArgs)
+		return runSync(ctx, stdout, cfg, streams, commandArgs)
 	case "entries":
-		return runEntries(ctx, stdout, cfg, adapter, commandArgs)
+		return runEntries(ctx, stdout, cfg, streams, commandArgs)
+	case "events":
+		return runEvents(ctx, stdout, cfg, streams, commandArgs)
 	case "search":
-		return runSearch(ctx, stdout, cfg, adapter, commandArgs)
+		return runSearch(ctx, stdout, cfg, streams, commandArgs)
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
@@ -145,6 +159,7 @@ type doctorReport struct {
 	DatabasePresent bool            `json:"database_present"`
 	DatabaseReady   bool            `json:"database_ready"`
 	Accounts        []doctorAccount `json:"accounts"`
+	Streams         []doctorStream  `json:"streams"`
 	Ready           bool            `json:"ready"`
 }
 
@@ -155,7 +170,16 @@ type doctorAccount struct {
 	Missing []string `json:"missing,omitempty"`
 }
 
-func runDoctor(ctx context.Context, stdout io.Writer, spec Spec, configPath string, cfg appconfig.Config, adapter source.Adapter, args []string) error {
+type doctorStream struct {
+	Name              string `json:"name"`
+	Stream            string `json:"stream"`
+	Enabled           bool   `json:"enabled"`
+	InitialLookback   string `json:"initial_lookback,omitempty"`
+	CheckpointOverlap string `json:"checkpoint_overlap,omitempty"`
+	MaxWindow         string `json:"max_window,omitempty"`
+}
+
+func runDoctor(ctx context.Context, stdout io.Writer, spec Spec, configPath string, cfg appconfig.Config, streams []source.StreamBinding, streamStatuses []doctorStream, args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	jsonOut := fs.Bool("json", false, "print JSON")
@@ -169,10 +193,11 @@ func runDoctor(ctx context.Context, stdout io.Writer, spec Spec, configPath stri
 		AppID:        spec.ID,
 		ConfigPath:   configPath,
 		DatabasePath: cfg.DBPath,
+		Streams:      append([]doctorStream(nil), streamStatuses...),
 		Ready:        true,
 	}
 	for _, account := range cfg.SourceAccounts() {
-		status := adapter.CheckCredentials(account)
+		status := streamCredentialStatus(streams, account)
 		report.Accounts = append(report.Accounts, doctorAccount{
 			ID:      account.ID,
 			Label:   account.Label,
@@ -185,7 +210,7 @@ func runDoctor(ctx context.Context, stdout io.Writer, spec Spec, configPath stri
 	}
 	if _, err := os.Stat(cfg.DBPath); err == nil {
 		report.DatabasePresent = true
-		if checkErr := checkArchiveDatabase(ctx, cfg, adapter); checkErr == nil {
+		if checkErr := checkArchiveDatabase(ctx, cfg, streams); checkErr == nil {
 			report.DatabaseReady = true
 		} else {
 			report.Ready = false
@@ -206,6 +231,19 @@ func runDoctor(ctx context.Context, stdout io.Writer, spec Spec, configPath stri
 			}
 			fmt.Fprintln(stdout)
 		}
+		for _, stream := range report.Streams {
+			fmt.Fprintf(stdout, "stream %s: module=%s enabled=%t", safeText(stream.Name), safeText(stream.Stream), stream.Enabled)
+			if stream.InitialLookback != "" {
+				fmt.Fprintf(stdout, " initial_lookback=%s", stream.InitialLookback)
+			}
+			if stream.CheckpointOverlap != "" {
+				fmt.Fprintf(stdout, " checkpoint_overlap=%s", stream.CheckpointOverlap)
+			}
+			if stream.MaxWindow != "" {
+				fmt.Fprintf(stdout, " max_window=%s", stream.MaxWindow)
+			}
+			fmt.Fprintln(stdout)
+		}
 	}
 	if !report.Ready {
 		return errors.New("doctor found missing credentials or an unreadable database")
@@ -213,7 +251,97 @@ func runDoctor(ctx context.Context, stdout io.Writer, spec Spec, configPath stri
 	return nil
 }
 
-func runStatus(ctx context.Context, stdout io.Writer, spec Spec, configPath string, cfg appconfig.Config, adapter source.Adapter, args []string) error {
+func configureStreams(available []source.StreamBinding, configured map[string]appconfig.StreamConfig) ([]source.StreamBinding, []doctorStream, []string) {
+	knownNames := make(map[string]struct{}, len(available)*2)
+	for _, binding := range available {
+		knownNames[binding.Name] = struct{}{}
+		knownNames[binding.Stream] = struct{}{}
+	}
+	unknownNames := make([]string, 0)
+	for name := range configured {
+		if _, ok := knownNames[name]; !ok {
+			unknownNames = append(unknownNames, name)
+		}
+	}
+	sort.Strings(unknownNames)
+	warnings := make([]string, 0, len(unknownNames))
+	for _, name := range unknownNames {
+		warnings = append(warnings, fmt.Sprintf("warning: configured stream %q does not match a binding or module", name))
+	}
+
+	enabled := make([]source.StreamBinding, 0, len(available))
+	statuses := make([]doctorStream, 0, len(available))
+	for _, original := range available {
+		binding := original
+		streamConfig, ok := configured[binding.Name]
+		if !ok {
+			streamConfig, ok = configured[binding.Stream]
+		}
+		isEnabled := true
+		if ok {
+			isEnabled = streamConfig.IsEnabled()
+			applyStreamDuration(streamConfig.InitialLookback, &binding.InitialLookback)
+			applyStreamDuration(streamConfig.CheckpointOverlap, &binding.CheckpointOverlap)
+			applyStreamDuration(streamConfig.MaxWindow, &binding.MaxWindow)
+		}
+		statuses = append(statuses, doctorStream{
+			Name:              binding.Name,
+			Stream:            binding.Stream,
+			Enabled:           isEnabled,
+			InitialLookback:   formatStreamDuration(binding.InitialLookback),
+			CheckpointOverlap: formatStreamDuration(binding.CheckpointOverlap),
+			MaxWindow:         formatStreamDuration(binding.MaxWindow),
+		})
+		if isEnabled {
+			enabled = append(enabled, binding)
+		}
+	}
+	return enabled, statuses, warnings
+}
+
+func applyStreamDuration(value string, target *time.Duration) {
+	if strings.TrimSpace(value) == "" {
+		return
+	}
+	duration, _ := time.ParseDuration(value)
+	*target = duration
+}
+
+func formatStreamDuration(value time.Duration) string {
+	if value == 0 {
+		return ""
+	}
+	return value.String()
+}
+
+func streamCredentialStatus(streams []source.StreamBinding, account source.Account) source.CredentialStatus {
+	status := source.CredentialStatus{Ready: true}
+	seen := make(map[string]struct{})
+	for _, binding := range streams {
+		var current source.CredentialStatus
+		if binding.Adapter != nil {
+			current = binding.Adapter.CheckCredentials(account)
+		} else if binding.Events != nil {
+			current = binding.Events.CheckCredentials(account)
+		} else {
+			status.Ready = false
+			continue
+		}
+		if !current.Ready {
+			status.Ready = false
+		}
+		for _, missing := range current.Missing {
+			if _, ok := seen[missing]; ok {
+				continue
+			}
+			seen[missing] = struct{}{}
+			status.Missing = append(status.Missing, missing)
+		}
+	}
+	return status
+}
+
+func runStatus(ctx context.Context, stdout io.Writer, spec Spec, configPath string, cfg appconfig.Config, streams []source.StreamBinding, args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	jsonOut := fs.Bool("json", false, "print normalized crawlkit status JSON")
@@ -223,13 +351,16 @@ func runStatus(ctx context.Context, stdout io.Writer, spec Spec, configPath stri
 	if fs.NArg() != 0 {
 		return errors.New("status takes flags only")
 	}
+	if len(streams) == 0 {
+		return errors.New("crawler source stream registry is empty")
+	}
 	status := archive.Status{
-		Exchange:     adapter.Exchange(),
+		Exchange:     streamExchange(streams[0]),
 		Path:         cfg.DBPath,
 		AccountCount: len(cfg.Accounts),
 	}
 	if _, err := os.Stat(cfg.DBPath); err == nil {
-		arc, err := openReadOnlyArchive(ctx, cfg, adapter)
+		arc, err := openReadOnlyArchive(ctx, cfg, streams)
 		if err != nil {
 			return err
 		}
@@ -240,6 +371,14 @@ func runStatus(ctx context.Context, stdout io.Writer, spec Spec, configPath stri
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
+	} else {
+		for _, account := range cfg.SourceAccounts() {
+			for _, binding := range streams {
+				status.Accounts = append(status.Accounts, archive.AccountStatus{
+					AccountID: account.ID, Label: account.Label, Stream: binding.Name,
+				})
+			}
+		}
 	}
 	normalized := normalizedStatus(spec, configPath, status)
 	if *jsonOut {
@@ -249,15 +388,34 @@ func runStatus(ctx context.Context, stdout io.Writer, spec Spec, configPath stri
 	if normalized.LastSyncAt != "" {
 		fmt.Fprintf(stdout, "last sync: %s\n", normalized.LastSyncAt)
 	}
+	for _, account := range status.Accounts {
+		fmt.Fprintf(stdout, "%s/%s: checkpoint=", safeText(account.AccountID), safeText(account.Stream))
+		if account.Checkpoint == nil {
+			fmt.Fprintln(stdout, "never")
+		} else {
+			fmt.Fprintln(stdout, account.Checkpoint.UTC().Format(time.RFC3339))
+		}
+	}
 	return nil
+}
+
+func streamExchange(binding source.StreamBinding) model.Exchange {
+	if binding.Adapter != nil {
+		return binding.Adapter.Exchange()
+	}
+	if binding.Events != nil {
+		return binding.Events.Exchange()
+	}
+	return ""
 }
 
 func normalizedStatus(spec Spec, configPath string, status archive.Status) control.Status {
 	counts := []control.Count{
 		control.NewCount("ledger_entries", "Ledger Entries", status.EntryCount),
+		control.NewCount("state_transitions", "State Transitions", status.TransitionCount),
 		control.NewCount("accounts", "Connected Accounts", int64(status.AccountCount)),
 	}
-	result := control.NewStatus(spec.ID, fmt.Sprintf("%d Ledger Entries across %d Connected Accounts", status.EntryCount, status.AccountCount))
+	result := control.NewStatus(spec.ID, fmt.Sprintf("%d Ledger Entries and %d State Transitions across %d Connected Accounts", status.EntryCount, status.TransitionCount, status.AccountCount))
 	result.State = "empty"
 	result.ConfigPath = configPath
 	result.DatabasePath = status.Path
@@ -272,7 +430,7 @@ func normalizedStatus(spec Spec, configPath string, status archive.Status) contr
 	return result
 }
 
-func runSync(ctx context.Context, stdout io.Writer, cfg appconfig.Config, adapter source.Adapter, args []string) error {
+func runSync(ctx context.Context, stdout io.Writer, cfg appconfig.Config, streams []source.StreamBinding, args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	accountID := fs.String("account", "", "Connected Account id")
@@ -293,7 +451,7 @@ func runSync(ctx context.Context, stdout io.Writer, cfg appconfig.Config, adapte
 	if err != nil {
 		return err
 	}
-	arc, err := openArchive(ctx, cfg, adapter)
+	arc, err := openArchive(ctx, cfg, streams)
 	if err != nil {
 		return err
 	}
@@ -309,9 +467,21 @@ func runSync(ctx context.Context, stdout io.Writer, cfg appconfig.Config, adapte
 			return err
 		}
 	} else {
-		fmt.Fprintf(stdout, "%s: %d entries in %d pages\n", report.Exchange, report.Entries, report.Pages)
+		if report.Transitions == 0 {
+			fmt.Fprintf(stdout, "%s: %d entries in %d pages\n", report.Exchange, report.Entries, report.Pages)
+		} else {
+			fmt.Fprintf(stdout, "%s: %d entries and %d transitions in %d pages\n", report.Exchange, report.Entries, report.Transitions, report.Pages)
+		}
 		for _, account := range report.Accounts {
-			fmt.Fprintf(stdout, "%s: entries=%d pages=%d", account.AccountID, account.Entries, account.Pages)
+			target := account.AccountID
+			if len(streams) > 1 {
+				target += "/" + account.Stream
+			}
+			fmt.Fprintf(stdout, "%s: entries=%d", safeText(target), account.Entries)
+			if account.Transitions > 0 {
+				fmt.Fprintf(stdout, " transitions=%d", account.Transitions)
+			}
+			fmt.Fprintf(stdout, " pages=%d", account.Pages)
 			if account.Error != "" {
 				fmt.Fprintf(stdout, " error=%s", safeText(account.Error))
 			}
@@ -321,10 +491,11 @@ func runSync(ctx context.Context, stdout io.Writer, cfg appconfig.Config, adapte
 	return syncErr
 }
 
-func runEntries(ctx context.Context, stdout io.Writer, cfg appconfig.Config, adapter source.Adapter, args []string) error {
+func runEntries(ctx context.Context, stdout io.Writer, cfg appconfig.Config, streams []source.StreamBinding, args []string) error {
 	fs := flag.NewFlagSet("entries", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	accountID := fs.String("account", "", "Connected Account id")
+	stream := fs.String("stream", "", "storage stream")
 	symbol := fs.String("symbol", "", "Exchange symbol")
 	entryType := fs.String("type", "", "Ledger Entry type")
 	sinceRaw := fs.String("since", "", "RFC3339 or YYYY-MM-DD start")
@@ -345,13 +516,14 @@ func runEntries(ctx context.Context, stdout io.Writer, cfg appconfig.Config, ada
 	if err != nil {
 		return err
 	}
-	arc, err := openExistingArchive(ctx, cfg, adapter)
+	arc, err := openExistingArchive(ctx, cfg, streams)
 	if err != nil {
 		return err
 	}
 	defer arc.Close()
 	entries, err := arc.Entries(ctx, archive.EntryQuery{
 		AccountID: strings.ToLower(strings.TrimSpace(*accountID)),
+		Stream:    strings.TrimSpace(*stream),
 		Symbol:    strings.ToUpper(strings.TrimSpace(*symbol)),
 		Type:      strings.ToUpper(strings.TrimSpace(*entryType)),
 		Since:     since,
@@ -364,11 +536,59 @@ func runEntries(ctx context.Context, stdout io.Writer, cfg appconfig.Config, ada
 	return writeEntries(stdout, entries, *jsonOut)
 }
 
-func runSearch(ctx context.Context, stdout io.Writer, cfg appconfig.Config, adapter source.Adapter, args []string) error {
+func runEvents(ctx context.Context, stdout io.Writer, cfg appconfig.Config, streams []source.StreamBinding, args []string) error {
+	fs := flag.NewFlagSet("events", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	accountID := fs.String("account", "", "Connected Account id")
+	stream := fs.String("stream", "", "storage stream")
+	objectType := fs.String("object-type", "", "mutable object type")
+	objectID := fs.String("object-id", "", "Exchange object id")
+	status := fs.String("status", "", "raw Exchange object status")
+	sinceRaw := fs.String("since", "", "RFC3339 or YYYY-MM-DD observation start")
+	untilRaw := fs.String("until", "", "RFC3339 or YYYY-MM-DD observation end")
+	limit := fs.Int("limit", 100, "maximum rows")
+	jsonOut := fs.Bool("json", false, "print JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("events takes flags only")
+	}
+	since, err := optionalTime(*sinceRaw)
+	if err != nil {
+		return err
+	}
+	until, err := optionalTime(*untilRaw)
+	if err != nil {
+		return err
+	}
+	arc, err := openExistingArchive(ctx, cfg, streams)
+	if err != nil {
+		return err
+	}
+	defer arc.Close()
+	events, err := arc.Events(ctx, archive.EventQuery{
+		AccountID:  strings.ToLower(strings.TrimSpace(*accountID)),
+		Stream:     strings.TrimSpace(*stream),
+		ObjectType: strings.TrimSpace(*objectType),
+		ObjectID:   strings.TrimSpace(*objectID),
+		Status:     strings.TrimSpace(*status),
+		Since:      since,
+		Until:      until,
+		Limit:      *limit,
+	})
+	if err != nil {
+		return err
+	}
+	return writeEvents(stdout, events, *jsonOut)
+}
+
+func runSearch(ctx context.Context, stdout io.Writer, cfg appconfig.Config, streams []source.StreamBinding, args []string) error {
 	query, flagArgs := searchArgs(args)
 	fs := flag.NewFlagSet("search", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	accountID := fs.String("account", "", "Connected Account id")
+	stream := fs.String("stream", "", "storage stream")
 	limit := fs.Int("limit", 100, "maximum rows")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(flagArgs); err != nil {
@@ -382,7 +602,7 @@ func runSearch(ctx context.Context, stdout io.Writer, cfg appconfig.Config, adap
 	} else if fs.NArg() != 0 {
 		return errors.New("search requires exactly one query")
 	}
-	arc, err := openExistingArchive(ctx, cfg, adapter)
+	arc, err := openExistingArchive(ctx, cfg, streams)
 	if err != nil {
 		return err
 	}
@@ -390,6 +610,7 @@ func runSearch(ctx context.Context, stdout io.Writer, cfg appconfig.Config, adap
 	entries, err := arc.Search(ctx, archive.SearchQuery{
 		Text:      query,
 		AccountID: strings.ToLower(strings.TrimSpace(*accountID)),
+		Stream:    strings.TrimSpace(*stream),
 		Limit:     *limit,
 	})
 	if err != nil {
@@ -417,6 +638,18 @@ func writeEntries(stdout io.Writer, entries []model.LedgerEntry, jsonOut bool) e
 	return nil
 }
 
+func writeEvents(stdout io.Writer, events []model.StateObservation, jsonOut bool) error {
+	if jsonOut {
+		return writeJSON(stdout, events)
+	}
+	for _, event := range events {
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			event.ObservedAt.UTC().Format(time.RFC3339), safeText(event.AccountID),
+			safeText(event.Stream), safeText(event.ObjectType), safeText(event.ObjectID), safeText(event.Status))
+	}
+	return nil
+}
+
 func safeText(value string) string {
 	value = strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
@@ -427,38 +660,38 @@ func safeText(value string) string {
 	return strings.TrimSpace(value)
 }
 
-func openArchive(ctx context.Context, cfg appconfig.Config, adapter source.Adapter) (*archive.Archive, error) {
+func openArchive(ctx context.Context, cfg appconfig.Config, streams []source.StreamBinding) (*archive.Archive, error) {
 	return archive.Open(ctx, archive.Options{
 		Path:     cfg.DBPath,
 		Accounts: cfg.SourceAccounts(),
-		Adapter:  adapter,
+		Streams:  streams,
 	})
 }
 
-func openExistingArchive(ctx context.Context, cfg appconfig.Config, adapter source.Adapter) (*archive.Archive, error) {
+func openExistingArchive(ctx context.Context, cfg appconfig.Config, streams []source.StreamBinding) (*archive.Archive, error) {
 	if _, err := os.Stat(cfg.DBPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("Archive does not exist at %s; run sync first", cfg.DBPath)
 		}
 		return nil, err
 	}
-	return openReadOnlyArchive(ctx, cfg, adapter)
+	return openReadOnlyArchive(ctx, cfg, streams)
 }
 
-func openReadOnlyArchive(ctx context.Context, cfg appconfig.Config, adapter source.Adapter) (*archive.Archive, error) {
+func openReadOnlyArchive(ctx context.Context, cfg appconfig.Config, streams []source.StreamBinding) (*archive.Archive, error) {
 	return archive.Open(ctx, archive.Options{
 		Path:     cfg.DBPath,
 		Accounts: cfg.SourceAccounts(),
-		Adapter:  adapter,
+		Streams:  streams,
 		ReadOnly: true,
 	})
 }
 
-func checkArchiveDatabase(ctx context.Context, cfg appconfig.Config, adapter source.Adapter) error {
+func checkArchiveDatabase(ctx context.Context, cfg appconfig.Config, streams []source.StreamBinding) error {
 	arc, err := archive.Open(ctx, archive.Options{
 		Path:           cfg.DBPath,
 		Accounts:       cfg.SourceAccounts(),
-		Adapter:        adapter,
+		Streams:        streams,
 		ReadOnly:       true,
 		CheckIntegrity: true,
 	})
@@ -496,6 +729,7 @@ Commands:
   doctor     Check config, credential presence, and database health.
   sync       Read Ledger Entries from the Exchange.
   entries    List local Ledger Entries.
+  events     List local State Transitions.
   search     Search the local Archive.
   status     Show local Archive status.
   metadata   Print crawlkit control metadata.
