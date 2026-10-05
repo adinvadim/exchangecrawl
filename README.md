@@ -115,5 +115,5 @@ crawlctl status
 `bybitcrawl metadata --json` and `binancecrawl metadata --json` expose separate
 app identities, database paths, and mutating `sync` commands to the scheduler.
 
-See [SPEC.md](SPEC.md) for the behavioral contract and [CONTEXT.md](CONTEXT.md)
+See [SPEC.md](SPEC.md) for the behavioral contract and [GLOSSARY.md](GLOSSARY.md)
 for domain language.
